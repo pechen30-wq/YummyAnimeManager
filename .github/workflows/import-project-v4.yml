@@ -1,4 +1,4 @@
-name: import-project-v4
+name: final-import
 
 on:
   push:
@@ -16,22 +16,23 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Assemble and import prepared project
+      - name: Assemble source archive
         shell: bash
         run: |
           set -euo pipefail
-          cat .import4/parts/*.b64 | tr -d '\r\n' | base64 -d > project-source.zip
+          cat .import4/parts/*.b64 | tr -d '\r\n' | base64 -d > project.tar.xz
           rm -rf .import-unpack
           mkdir .import-unpack
-          unzip -q project-source.zip -d .import-unpack
+          tar -xJf project.tar.xz -C .import-unpack
           cp -a .import-unpack/YummyAnimeManager_project/. ./
-          rm -rf .import .import2 .import3 .import4 .import-unpack project-source.zip
+
+          rm -rf .import .import2 .import3 .import4 .import-unpack project.tar.xz
           rm -f .github/workflows/import-project.yml
           rm -f .github/workflows/import-project-v2.yml
           rm -f .github/workflows/import-project-v3.yml
           rm -f .github/workflows/import-project-v4.yml
 
-      - name: Commit imported project
+      - name: Commit source tree
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
@@ -40,6 +41,46 @@ jobs:
           if git diff --cached --quiet; then
             echo "Nothing to commit"
           else
-            git commit -m "Import YummyAnime Manager project"
-            git push
+            git commit -m "Import YummyAnime Manager 4.2.1"
+            git push origin main
           fi
+
+  validate-and-build:
+    needs: import
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Validate Python
+        run: |
+          python -m py_compile main.py resolvers.py
+          python tests/test_resolvers.py
+          python tests/test_plexmatch.py
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build Windows bootstrap EXE
+        run: python bootstrap/build_bootstrap.py
+
+      - name: Commit executable and update manifest
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dist/YummyAnimeManager.exe dist/SHA256SUMS.txt update.json
+          if (-not (git diff --cached --quiet)) {
+            git commit -m "Build Windows EXE $((Get-Content VERSION -Raw).Trim())"
+            git push origin main
+          }
