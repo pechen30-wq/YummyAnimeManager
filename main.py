@@ -15,6 +15,9 @@ from typing import Any
 
 import requests
 from resilient_download import download_file
+from chapters import aniskip_points, inspect_media, remux_to_mkv
+from diagnostics import LOGGER, LOG_DIR, configure_logging, install_exception_hooks, safe_url
+from url_history import remember_url
 
 from resolvers import (
     PlayerResolver, StreamResult, choose_stream, find_ffmpeg, provider_kind,
@@ -31,7 +34,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "YummyAnime Manager"
-APP_VERSION = "4.2.1"
+APP_VERSION = "4.3.0"
 YUMMY_API_BASE = "https://api.yani.tv"
 CVH_API_BASE = "https://plapi.cdnvideohub.com/api/v1/player/sv"
 
@@ -358,7 +361,9 @@ class YummyApi:
     def get(self, path, params=None):
         if not self.public_token:
             raise RuntimeError("Не указан публичный X-Application token.")
+        LOGGER.debug("YummyAnime API GET %s",path)
         r = requests.get(YUMMY_API_BASE + path, params=params, headers=self.headers, timeout=25)
+        LOGGER.debug("YummyAnime API status=%s path=%s",r.status_code,path)
         if r.status_code == 401:
             raise RuntimeError("YummyAnime отклонил публичный X-Application token (401).")
         if r.status_code == 404:
@@ -643,6 +648,7 @@ def merge_audio_tracks(mkvmerge, sources, output_path, progress_cb=None):
     lines=[]; last=-1
     for line in proc.stdout or []:
         lines.append(line.rstrip())
+        LOGGER.debug("mkvmerge: %s", line.rstrip())
         pm=re.search(r"Progress:\s*(\d+)%",line,re.I)
         if pm:
             pct=max(0,min(100,int(pm.group(1))))
@@ -670,6 +676,7 @@ class FetchThread(QThread):
                 raise RuntimeError("API не вернул anime_id.")
             self.loaded.emit(anime, api.videos(int(anime_id)))
         except Exception as e:
+            LOGGER.exception("Anime metadata request failed for slug=%s", self.slug)
             self.failed.emit(str(e))
 
 
@@ -687,7 +694,9 @@ class QualityProbeThread(QThread):
                 if not labels and stream.quality: labels.add(stream.quality)
                 labels={str(x) for x in labels if x}
                 if labels: sets.append(labels); successes+=1
-            except Exception as e: notes.append(f"{getattr(item,'dubbing','')}: {e}")
+            except Exception as e:
+                LOGGER.exception("Quality probe failed for dubbing=%s", getattr(item, 'dubbing', ''))
+                notes.append(f"{getattr(item,'dubbing','')}: {e}")
             finally:
                 if stream is not None: PlayerResolver.release(stream)
         if sets:
@@ -707,13 +716,15 @@ class WorkThread(QThread):
     failed=Signal(str)
     def __init__(self,player,dubbings,episode_items,quality,base_dir,anime_title,merge_enabled,
                  mkvmerge_path,keep_sources,season_number=1,plex_structure=True,
-                 plexmatch_enabled=True,anime_metadata=None,resolver_config=None,ffmpeg_path=""):
+                 plexmatch_enabled=True,anime_metadata=None,resolver_config=None,ffmpeg_path="",
+                 chapters_enabled=True):
         super().__init__(); self.player=player; self.dubbings=dubbings; self.episode_items=episode_items
         self.quality=quality; self.base_dir=Path(base_dir); self.anime_title=anime_title
         self.merge_enabled=merge_enabled; self.mkvmerge=mkvmerge_path; self.keep_sources=keep_sources
         self.season_number=int(season_number or 1); self.plex_structure=bool(plex_structure)
         self.plexmatch_enabled=bool(plexmatch_enabled); self.anime_metadata=anime_metadata or {}
         self.resolver_config=resolver_config or {}; self.ffmpeg=ffmpeg_path or find_ffmpeg()
+        self.chapters_enabled=chapters_enabled
         self.resolver=PlayerResolver(self.resolver_config)
     def emit_progress(self,ep_index,total_eps,series_pct,status):
         series_pct=max(0,min(100,int(series_pct)))
@@ -722,6 +733,44 @@ class WorkThread(QThread):
     def resolve_stream(self,item):
         result=self.resolver.resolve(item); label,url=choose_stream(result,self.quality)
         result.url=url; result.quality=label; return result
+    def ensure_chapters(self, media_path, item, episode, chapter_source=None):
+        media_path=Path(media_path)
+        if not self.chapters_enabled:
+            return media_path
+        if not self.ffmpeg or not Path(self.ffmpeg).exists():
+            LOGGER.warning("Chapter inspection skipped: FFmpeg is unavailable")
+            return media_path
+        info=inspect_media(self.ffmpeg,media_path)
+        LOGGER.info("Chapter inspection: %s existing=%s duration=%.3f",
+                    media_path,info.chapters,info.duration)
+        if info.chapters:
+            if media_path.suffix.lower() != ".mkv":
+                target=media_path.with_suffix(".mkv")
+                remux_to_mkv(self.ffmpeg,media_path,target,keep_source=self.keep_sources)
+                return target
+            return media_path
+        if chapter_source and Path(chapter_source) != media_path:
+            source_info=inspect_media(self.ffmpeg,chapter_source)
+            if source_info.chapters:
+                remux_to_mkv(self.ffmpeg,media_path,media_path,chapter_source=chapter_source)
+                LOGGER.info("Copied %s embedded chapters from first source",source_info.chapters)
+                return media_path
+        remote=self.anime_metadata.get("remote_ids") or {}
+        mal_id=remote.get("myanimelist_id") if isinstance(remote,dict) else None
+        duration=info.duration
+        if duration<=0:
+            try: duration=float(getattr(item,"duration",0) or 0)
+            except (TypeError,ValueError): duration=0
+        points=aniskip_points(mal_id,episode,duration)
+        if not points:
+            LOGGER.info("No matching AniSkip chapters: MAL=%s episode=%s duration=%.3f",
+                        mal_id,episode,duration)
+            return media_path
+        target=media_path if media_path.suffix.lower()==".mkv" else media_path.with_suffix(".mkv")
+        remux_to_mkv(self.ffmpeg,media_path,target,points=points,duration=duration,
+                     keep_source=self.keep_sources)
+        LOGGER.info("Added %s AniSkip chapters to %s",len(points),target)
+        return target
     @staticmethod
     def extension_for(result):
         if result.is_manifest: return ".mkv"
@@ -733,7 +782,8 @@ class WorkThread(QThread):
             if not self.ffmpeg or not Path(self.ffmpeg).exists():
                 raise RuntimeError("Для HLS/DASH нужен FFmpeg. Откройте Настройки и укажите ffmpeg.exe.")
             headers=dict(result.headers or {})
-            cmd=[self.ffmpeg,"-y","-hide_banner","-loglevel","error","-nostats","-progress","pipe:1"]
+            cmd=[self.ffmpeg,"-y","-hide_banner","-loglevel",
+                 "info" if LOGGER.isEnabledFor(10) else "error","-nostats","-progress","pipe:1"]
             ua=headers.pop("User-Agent",headers.pop("user-agent",""))
             if ua:
                 cmd += ["-user_agent", ua]
@@ -767,6 +817,7 @@ class WorkThread(QThread):
             errors=[]; last=-1
             for line in proc.stdout or []:
                 line=line.strip(); seconds=None
+                LOGGER.debug("FFmpeg: %s",line)
                 if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
                     try: seconds=float(line.split("=",1)[1])/1_000_000.0
                     except Exception: pass
@@ -785,6 +836,8 @@ class WorkThread(QThread):
         download_file(result.url, path, headers, progress_cb)
     def run(self):
         try:
+            LOGGER.info("Download started: title=%s episodes=%s dubbings=%s quality=%s chapters=%s",
+                        self.anime_title,len(self.episode_items),self.dubbings,self.quality,self.chapters_enabled)
             title_dir=self.base_dir/safe_name(self.anime_title)
             media_dir=title_dir/f"Season {self.season_number:02d}" if self.plex_structure else title_dir
             if self.plexmatch_enabled: write_plexmatch(title_dir,self.anime_metadata)
@@ -794,6 +847,7 @@ class WorkThread(QThread):
                 raise RuntimeError("MKVToolNix не найден. Укажите путь к mkvmerge.exe в Настройках.")
             download_part=90.0 if use_merge else 100.0; dub_span=download_part/max(1,len(self.dubbings))
             for ep_index,ep in enumerate(episodes,1):
+                LOGGER.info("Episode %s started",ep)
                 source_files=[]; ep_label=episode_label(ep); temp_dir=title_dir/".tmp"/f"episode_{safe_name(ep_label)}"; failed=False
                 self.emit_progress(ep_index,total_eps,0,f"Серия {ep_label} ({ep_index}/{len(episodes)}): подготовка…")
                 for dub_index,dub in enumerate(self.dubbings,1):
@@ -820,6 +874,8 @@ class WorkThread(QThread):
                                 time.sleep(0.8 * (attempt - 1))
 
                             stream = self.resolve_stream(item)
+                            LOGGER.info("Resolved episode=%s dubbing=%s provider=%s quality=%s URL=%s",
+                                        ep,dub,stream.source,stream.quality,safe_url(stream.url))
                             ext = self.extension_for(stream)
                             qtag = safe_name(stream.quality or "auto")
 
@@ -850,12 +906,20 @@ class WorkThread(QThread):
                                 )
 
                             self.download_stream(stream, dest, item, fp)
+                            if not use_merge:
+                                try:
+                                    dest=self.ensure_chapters(dest,item,ep)
+                                except Exception as chapter_error:
+                                    LOGGER.exception("Chapter processing failed for episode=%s dubbing=%s",ep,dub)
+                                    errors.append(f"Серия {ep_label}, {dub}: главы не добавлены: {chapter_error}")
                             source_files.append((dest, dub))
                             last_error = None
                             break
 
                         except Exception as e:
                             last_error = e
+                            LOGGER.exception("Download attempt failed: episode=%s dubbing=%s attempt=%s/%s",
+                                             ep,dub,attempt,max_attempts)
                             if provider != "aksor" or attempt >= max_attempts:
                                 break
                         finally:
@@ -876,8 +940,16 @@ class WorkThread(QThread):
                     try:
                         def mp(pct): self.emit_progress(ep_index,total_eps,90+pct*0.10,f"Серия {ep_label} ({ep_index}/{len(episodes)}): MKVToolNix — {pct}%")
                         merge_audio_tracks(self.mkvmerge,source_files,output,progress_cb=mp); completed+=1
+                        try:
+                            first_item=self.episode_items[ep].get(self.dubbings[0])
+                            self.ensure_chapters(output,first_item,ep,chapter_source=source_files[0][0])
+                        except Exception as chapter_error:
+                            LOGGER.exception("Chapter processing failed for merged episode=%s",ep)
+                            errors.append(f"Серия {ep_label}: главы не добавлены: {chapter_error}")
                         if not self.keep_sources: shutil.rmtree(temp_dir,ignore_errors=True)
-                    except Exception as e: errors.append(f"Серия {ep_label}: MKVToolNix: {e}")
+                    except Exception as e:
+                        LOGGER.exception("MKV merge failed for episode=%s",ep)
+                        errors.append(f"Серия {ep_label}: MKVToolNix: {e}")
                 else: completed+=1
                 self.emit_progress(ep_index,total_eps,100,f"Серия {ep_label} ({ep_index}/{len(episodes)}): готово.")
             if use_merge and not self.keep_sources:
@@ -885,7 +957,9 @@ class WorkThread(QThread):
                 except Exception: pass
             self.progress.emit(100,100,"Готово")
             self.done.emit(f"Готово. Обработано серий: {completed}. Ошибок/пропусков: {len(errors)}.",errors)
-        except Exception as e: self.failed.emit(str(e))
+        except Exception as e:
+            LOGGER.exception("Download worker failed")
+            self.failed.emit(str(e))
 
 
 class SettingsDialog(QDialog):
@@ -930,12 +1004,17 @@ class SettingsDialog(QDialog):
 
         self.alloha_resolver = QLineEdit(config.get("alloha_resolver_url", "http://127.0.0.1:8790"))
         self.alloha_resolver.setPlaceholderText("http://127.0.0.1:8790")
+        self.diagnostic_log = QCheckBox("Подробный журнал для диагностики ошибок")
+        self.diagnostic_log.setChecked(bool(config.get("diagnostic_logging", False)))
+        open_logs = QPushButton("Открыть папку логов")
+        open_logs.clicked.connect(self.open_log_folder)
 
         form.addRow("Публичный токен (X-Application):", self.public_token)
         form.addRow("Язык:", self.lang)
         form.addRow("mkvmerge.exe:", mkv_row)
         form.addRow("ffmpeg.exe:", ff_row)
         form.addRow("Alloha resolver server:", self.alloha_resolver)
+        form.addRow(self.diagnostic_log, open_logs)
         layout.addLayout(form)
 
         token_note = QLabel(
@@ -965,6 +1044,10 @@ class SettingsDialog(QDialog):
         if path:
             self.ffmpeg_path.setText(path)
 
+    def open_log_folder(self):
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(LOG_DIR)))
+
     def values(self):
         return {
             "public_token": self.public_token.text().strip(),
@@ -972,6 +1055,7 @@ class SettingsDialog(QDialog):
             "mkvmerge_path": self.mkv_path.text().strip(),
             "ffmpeg_path": self.ffmpeg_path.text().strip(),
             "alloha_resolver_url": self.alloha_resolver.text().strip().rstrip("/"),
+            "diagnostic_logging": self.diagnostic_log.isChecked(),
         }
 
 
@@ -982,6 +1066,8 @@ class MainWindow(QMainWindow):
         self.resize(1050, 760)
 
         self.config = load_config()
+        configure_logging(bool(self.config.get("diagnostic_logging", False)))
+        LOGGER.info("Starting %s %s", APP_NAME, APP_VERSION)
         if not self.config.get("mkvmerge_path"):
             self.config["mkvmerge_path"] = find_mkvmerge()
         if not self.config.get("ffmpeg_path"):
@@ -1004,8 +1090,12 @@ class MainWindow(QMainWindow):
 
         # URL row
         row = QHBoxLayout()
-        self.url_edit = QLineEdit()
-        self.url_edit.setPlaceholderText("https://ru.yummyani.me/catalog/item/parad-smerti")
+        self.url_edit = QComboBox()
+        self.url_edit.setEditable(True)
+        self.url_edit.setInsertPolicy(QComboBox.NoInsert)
+        self.url_edit.addItems(self.config.get("url_history", [])[:10])
+        self.url_edit.setCurrentIndex(-1)
+        self.url_edit.lineEdit().setPlaceholderText("https://ru.yummyani.me/catalog/item/parad-smerti")
         self.load_btn = QPushButton("Загрузить")
         self.settings_btn = QPushButton("Настройки")
         row.addWidget(self.url_edit, 1)
@@ -1082,17 +1172,22 @@ class MainWindow(QMainWindow):
         layout.addWidget(splitter, 1)
 
         # merge
-        merge_box = QGroupBox("Несколько озвучек")
+        merge_box = QGroupBox("MKV и озвучки")
         merge_layout = QVBoxLayout(merge_box)
-        self.merge_check = QCheckBox(
-            "Объединить выбранные озвучки в один MKV через MKVToolNix "
-            "(видео берётся из первой отмеченной озвучки)"
-        )
+        self.merge_check = QCheckBox("Объединить озвучки в один MKV")
+        self.merge_check.setToolTip("Видео берётся из первой выбранной озвучки; нужен MKVToolNix.")
         self.merge_check.setChecked(True)
-        self.keep_sources = QCheckBox("Не удалять временные исходные MP4 после сборки MKV")
+        self.keep_sources = QCheckBox("Сохранять исходные файлы после сборки MKV")
+        self.chapters_check = QCheckBox("Добавлять главы из видео или AniSkip")
+        self.chapters_check.setToolTip(
+            "Сначала используются главы исходного видео. Если их нет, ищутся метки OP/ED/recap "
+            "по MyAnimeList ID и длительности серии."
+        )
+        self.chapters_check.setChecked(bool(self.config.get("chapters_enabled", True)))
         self.mkv_status = QLabel("")
         merge_layout.addWidget(self.merge_check)
         merge_layout.addWidget(self.keep_sources)
+        merge_layout.addWidget(self.chapters_check)
         merge_layout.addWidget(self.mkv_status)
         layout.addWidget(merge_box)
 
@@ -1206,6 +1301,8 @@ class MainWindow(QMainWindow):
             self.config.update(dlg.values())
             self.config["download_dir"] = self.folder_edit.text()
             save_config(self.config)
+            configure_logging(bool(self.config.get("diagnostic_logging", False)))
+            LOGGER.info("Settings saved")
             self.update_mkv_status()
             self.update_source_status()
 
@@ -1225,7 +1322,8 @@ class MainWindow(QMainWindow):
 
     def load_anime(self):
         try:
-            slug = extract_slug(self.url_edit.text())
+            url = self.url_edit.currentText().strip()
+            slug = extract_slug(url)
         except Exception as e:
             QMessageBox.warning(self, APP_NAME, str(e))
             return
@@ -1234,6 +1332,13 @@ class MainWindow(QMainWindow):
             self.show_settings()
             if not self.config.get("public_token"):
                 return
+
+        self.config["url_history"] = remember_url(self.config.get("url_history"), url)
+        self.url_edit.clear()
+        self.url_edit.addItems(self.config["url_history"])
+        self.url_edit.setCurrentIndex(0)
+        save_config(self.config)
+        LOGGER.info("Loading anime slug=%s URL=%s", slug, safe_url(url))
 
         self.load_btn.setEnabled(False)
         self.title_label.setText("Загрузка…")
@@ -1251,6 +1356,7 @@ class MainWindow(QMainWindow):
         self.fetch_thread.start()
 
     def on_load_failed(self, error):
+        LOGGER.error("Anime load failed: %s",error)
         self.load_btn.setEnabled(True)
         self.title_label.setText("Ошибка")
         QMessageBox.critical(self, APP_NAME, error)
@@ -1258,6 +1364,7 @@ class MainWindow(QMainWindow):
     def on_loaded(self, anime, raw):
         self.load_btn.setEnabled(True)
         self.anime = anime
+        LOGGER.info("Anime loaded: video_records=%s",len(raw) if isinstance(raw,list) else 0)
 
         title = anime.get("title") or anime.get("name") or "Без названия"
         if isinstance(title, dict):
@@ -1411,6 +1518,7 @@ class MainWindow(QMainWindow):
                 return
 
         self.config["download_dir"] = self.folder_edit.text()
+        self.config["chapters_enabled"] = self.chapters_check.isChecked()
         save_config(self.config)
 
         quality_value=self.quality_combo.currentData()
@@ -1418,6 +1526,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self,APP_NAME,"Дождитесь определения доступных качеств или выберите доступное качество."); return
         self.download_btn.setEnabled(False); self.series_progress.setValue(0); self.overall_progress.setValue(0)
         self.current_status_label.setText("Подготовка загрузки…")
+        LOGGER.info("Selection: player=%s dubbings=%s episodes=%s quality=%s merge=%s",
+                    player,dubbings,episodes,quality_value,do_merge)
 
         self.work_thread = WorkThread(
             player=player,
@@ -1435,6 +1545,7 @@ class MainWindow(QMainWindow):
             anime_metadata=self.anime,
             resolver_config=self.config,
             ffmpeg_path=self.config.get("ffmpeg_path", "") or find_ffmpeg(),
+            chapters_enabled=self.chapters_check.isChecked(),
         )
         self.work_thread.progress.connect(self.on_progress)
         self.work_thread.done.connect(self.on_done)
@@ -1446,6 +1557,7 @@ class MainWindow(QMainWindow):
         self.current_status_label.setText(text); self.statusBar().showMessage(text)
 
     def on_done(self, summary, errors):
+        LOGGER.info("Download finished: %s errors=%s",summary,len(errors))
         self.download_btn.setEnabled(True); self.series_progress.setValue(100); self.overall_progress.setValue(100)
         self.current_status_label.setText(summary)
         detail = ""
@@ -1456,12 +1568,14 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, APP_NAME, summary + detail)
 
     def on_work_failed(self, error):
+        LOGGER.error("Download failed: %s",error)
         self.download_btn.setEnabled(True); self.current_status_label.setText(f"Ошибка: {error}")
         QMessageBox.critical(self, APP_NAME, error)
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    install_exception_hooks()
     app.setApplicationName(APP_NAME)
     win = MainWindow()
     win.show()

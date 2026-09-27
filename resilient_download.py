@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 import requests
+from diagnostics import LOGGER, safe_url
 
 
 RETRYABLE = (
@@ -30,6 +31,7 @@ def download_file(url, path, headers, progress_cb, *, attempts=4, sleep=time.sle
         request_headers = dict(headers)
         if offset:
             request_headers["Range"] = f"bytes={offset}-"
+        LOGGER.debug("Download request %s attempt=%s/%s offset=%s", safe_url(url), attempt, attempts, offset)
         try:
             with requests.get(url, headers=request_headers, stream=True,
                               timeout=(15, 60), allow_redirects=True) as response:
@@ -37,6 +39,9 @@ def download_file(url, path, headers, progress_cb, *, attempts=4, sleep=time.sle
                     part.unlink(missing_ok=True)
                     raise requests.exceptions.ConnectionError("Сервер отклонил Range; начинаю загрузку заново")
                 response.raise_for_status()
+                LOGGER.debug("Download response status=%s range=%s content_length=%s",
+                             response.status_code, response.headers.get("Content-Range"),
+                             response.headers.get("Content-Length"))
                 append = False
                 expected_end = 0
                 if offset and response.status_code == 206:
@@ -83,10 +88,13 @@ def download_file(url, path, headers, progress_cb, *, attempts=4, sleep=time.sle
                 if not downloaded:
                     raise requests.exceptions.ConnectionError("Сервер вернул пустой видеофайл")
             part.replace(path)
+            LOGGER.info("Download complete: %s bytes=%s", path, path.stat().st_size)
             progress_cb(100, "100%")
             return
         except RETRYABLE as error:
             last_error = error
+            LOGGER.warning("Download interrupted attempt=%s/%s: %s: %s",
+                           attempt, attempts, type(error).__name__, error)
             if attempt == attempts:
                 break
             delay = min(8.0, 0.8 * 2 ** (attempt - 1)) * random.uniform(0.75, 1.25)

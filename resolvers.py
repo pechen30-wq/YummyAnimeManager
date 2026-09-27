@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import requests
+from diagnostics import LOGGER, safe_url
 
 CHROME_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -149,7 +150,9 @@ def find_ffmpeg():
 
 def _request(session, method, url, **kwargs):
     kwargs.setdefault("timeout", 30)
+    LOGGER.debug("Resolver HTTP %s %s",method,safe_url(url))
     r = session.request(method, url, **kwargs)
+    LOGGER.debug("Resolver HTTP status=%s final=%s",r.status_code,safe_url(r.url))
     r.raise_for_status()
     return r
 
@@ -174,6 +177,7 @@ def _stream_probe(session, url, headers=None, timeout=10):
     headers.setdefault("User-Agent", CHROME_UA)
     headers.setdefault("Range", "bytes=0-2047")
     try:
+        LOGGER.debug("Stream probe %s",safe_url(url))
         response = session.get(
             url,
             headers=headers,
@@ -182,6 +186,7 @@ def _stream_probe(session, url, headers=None, timeout=10):
             allow_redirects=True,
         )
         if response.status_code not in (200, 206):
+            LOGGER.warning("Stream probe returned HTTP %s for %s",response.status_code,safe_url(url))
             msg = f"HTTP {response.status_code}"
             response.close()
             return False, url, msg
@@ -192,6 +197,7 @@ def _stream_probe(session, url, headers=None, timeout=10):
             response.close()
         return True, final_url, ""
     except Exception as e:
+        LOGGER.exception("Stream probe failed for %s",safe_url(url))
         return False, url, str(e)
 
 
@@ -287,6 +293,8 @@ class PlayerResolver:
 
     def resolve(self, item):
         kind = provider_kind(item)
+        LOGGER.debug("Resolving provider=%s episode=%s dubbing=%s",kind,
+                     getattr(item,"number",""),getattr(item,"dubbing",""))
         if kind == "direct":
             url = normalize_http_url(item.iframe_url)
             return StreamResult(url, "direct", {"auto": url}, {"User-Agent": CHROME_UA})

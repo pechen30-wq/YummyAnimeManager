@@ -27,7 +27,9 @@ jobs:
           cp -a .import-unpack/YummyAnimeManager_project/. ./
           # Keep the committed network retry fix when the older archive is imported.
           git show HEAD:main.py > main.py
+          git show HEAD:resolvers.py > resolvers.py
           git show HEAD:resilient_download.py > resilient_download.py
+          git show HEAD:README.md > README.md
 
           rm -rf .import .import2 .import3 .import4 .import-unpack project.tar.xz
           rm -f .github/workflows/import-project.yml
