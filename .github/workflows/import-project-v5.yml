@@ -1,0 +1,47 @@
+name: import-project-v5
+
+on:
+  push:
+    paths:
+      - ".import5/assemble.flag"
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Assemble and import prepared project
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .import5/parts/*.b64 | tr -d '\r\n' | base64 -d > project-source.zip
+          echo "82b5f1d90882757af5746024da41083fbf586c43cf0a2667b7acb9cf105d279e  project-source.zip" | sha256sum -c -
+          rm -rf .import-unpack
+          mkdir .import-unpack
+          unzip -q project-source.zip -d .import-unpack
+          cp -a .import-unpack/YummyAnimeManager_project/. ./
+          rm -rf .import .import2 .import3 .import4 .import5 .import-unpack project-source.zip
+          rm -f .github/workflows/import-project.yml
+          rm -f .github/workflows/import-project-v2.yml
+          rm -f .github/workflows/import-project-v3.yml
+          rm -f .github/workflows/import-project-v4.yml
+          rm -f .github/workflows/import-project-v5.yml
+
+      - name: Commit imported project
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+          else
+            git commit -m "Import YummyAnime Manager project"
+            git push
+          fi
