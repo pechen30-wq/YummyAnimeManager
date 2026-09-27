@@ -73,6 +73,8 @@ start_alloha_resolver.bat
 
 ```bash
 python -m unittest discover -s tests -v
+python test_resolvers.py
+python test_plexmatch.py
 ```
 
 ## Обновления
