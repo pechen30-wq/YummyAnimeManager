@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import random
 import urllib.parse
 from pathlib import Path
 from dataclasses import dataclass
@@ -36,7 +37,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "YummyAnime Manager"
-APP_VERSION = "4.4.0"
+APP_VERSION = "4.4.1"
 YUMMY_API_BASE = "https://api.yani.tv"
 CVH_API_BASE = "https://plapi.cdnvideohub.com/api/v1/player/sv"
 
@@ -363,16 +364,38 @@ class YummyApi:
     def get(self, path, params=None):
         if not self.public_token:
             raise RuntimeError("Не указан публичный X-Application token.")
-        LOGGER.debug("YummyAnime API GET %s",path)
-        r = requests.get(YUMMY_API_BASE + path, params=params, headers=self.headers, timeout=25)
-        LOGGER.debug("YummyAnime API status=%s path=%s",r.status_code,path)
-        if r.status_code == 401:
-            raise RuntimeError("YummyAnime отклонил публичный X-Application token (401).")
-        if r.status_code == 404:
-            raise RuntimeError("Тайтл не найден (404).")
-        r.raise_for_status()
-        data = r.json()
-        return data.get("response", data)
+        attempts = 4
+        retryable_status = {429, 500, 502, 503, 504}
+        last_error = None
+        for attempt in range(1, attempts + 1):
+            LOGGER.debug("YummyAnime API GET %s attempt=%s/%s", path, attempt, attempts)
+            try:
+                # requests.get opens a new connection on each attempt.
+                response = requests.get(YUMMY_API_BASE + path, params=params,
+                                        headers=self.headers, timeout=(5, 20))
+                LOGGER.debug("YummyAnime API status=%s path=%s", response.status_code, path)
+                if response.status_code == 401:
+                    raise RuntimeError("YummyAnime отклонил публичный X-Application token (401).")
+                if response.status_code == 404:
+                    raise RuntimeError("Тайтл не найден (404).")
+                if response.status_code in retryable_status:
+                    last_error = requests.exceptions.HTTPError(f"HTTP {response.status_code}")
+                    response.close()
+                else:
+                    response.raise_for_status()
+                    data = response.json()
+                    return data.get("response", data)
+            except (ConnectionResetError, requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout) as error:
+                last_error = error
+            LOGGER.warning("YummyAnime API temporary error attempt=%s/%s path=%s: %s",
+                           attempt, attempts, path, last_error)
+            if attempt < attempts:
+                time.sleep(min(8, 0.8 * 2 ** (attempt - 1)) * random.uniform(0.75, 1.25))
+        raise RuntimeError(
+            f"Не удалось получить данные YummyAnime после {attempts} попыток. "
+            f"Проверьте подключение к api.yani.tv и повторите запрос. Причина: {last_error}"
+        ) from last_error
 
     def anime(self, slug):
         return self.get(f"/anime/{urllib.parse.quote(slug, safe='')}", {"need_videos": "true"})

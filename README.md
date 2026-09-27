@@ -27,7 +27,7 @@ Plex-friendly naming и `.plexmatch`.
 
 Готовый файл находится в `dist/YummyAnimeManager.exe`.
 
-Это сборка PyInstaller версии 4.4.0. Для объединения озвучек нужен MKVToolNix.
+Это сборка PyInstaller версии 4.4.1. Для объединения озвучек нужен MKVToolNix.
 Настройки хранятся в `%USERPROFILE%\\.yummy_anime_manager` и не входят в репозиторий.
 
 ## Запуск из исходников
