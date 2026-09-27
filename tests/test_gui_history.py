@@ -1,5 +1,7 @@
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -37,6 +39,17 @@ class HistoryGuiTests(unittest.TestCase):
                 window.on_loaded({"title": "Test"}, raw)
             self.assertEqual(window.player_combo.currentText(), "CVH")
             self.assertNotIn("parad-smerti", window.url_edit.lineEdit().placeholderText())
+
+    def test_failed_update_is_reported_once(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("main.CONFIG_DIR", Path(directory)), \
+             patch("main.load_config", return_value={"public_token": "test"}):
+            marker = Path(directory) / "update-result.txt"
+            marker.write_text("error: access denied", encoding="utf-8")
+            window = MainWindow()
+            self.addCleanup(window.close)
+            self.assertFalse(marker.exists())
+            self.assertIsNone(window.previous_update_error())
 
 
 if __name__ == "__main__":

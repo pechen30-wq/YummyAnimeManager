@@ -1272,8 +1272,22 @@ class MainWindow(QMainWindow):
         self.download_btn.clicked.connect(self.start_download)
 
         self.update_mkv_status()
-        if getattr(sys, "frozen", False) and self.config.get("auto_update", True):
+        update_error = self.previous_update_error()
+        if update_error:
+            QTimer.singleShot(0, lambda: QMessageBox.warning(
+                self, APP_NAME, f"Не удалось применить обновление: {update_error}"))
+        if (not update_error and getattr(sys, "frozen", False)
+                and self.config.get("auto_update", True)):
             QTimer.singleShot(0, self.check_for_updates)
+
+    def previous_update_error(self):
+        result_file = CONFIG_DIR / "update-result.txt"
+        try:
+            result = result_file.read_text(encoding="utf-8-sig").strip()
+        except OSError:
+            return None
+        result_file.unlink(missing_ok=True)
+        return result.removeprefix("error: ") if result.startswith("error: ") else None
 
     def check_for_updates(self):
         self.update_check_thread = UpdateCheckThread(self)
