@@ -26,6 +26,18 @@ class HistoryGuiTests(unittest.TestCase):
             self.assertEqual(window.url_edit.itemText(1), "https://example.com/old")
             save.assert_called()
 
+    def test_cvh_is_initial_player_when_available(self):
+        with patch("main.load_config", return_value={"public_token": "test"}):
+            window = MainWindow()
+            self.addCleanup(window.close)
+            raw = [{"data": {"player": player, "dubbing": "AniDUB"},
+                    "number": "1", "index": 1, "iframe_url": ""}
+                   for player in ("Kodik", "CVH")]
+            with patch.object(window, "schedule_quality_probe"):
+                window.on_loaded({"title": "Test"}, raw)
+            self.assertEqual(window.player_combo.currentText(), "CVH")
+            self.assertNotIn("parad-smerti", window.url_edit.lineEdit().placeholderText())
+
 
 if __name__ == "__main__":
     unittest.main()

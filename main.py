@@ -24,7 +24,9 @@ from resolvers import (
     provider_label, system_proxy_for, CHROME_UA,
     DIRECT_MEDIA_EXTS as RESOLVER_MEDIA_EXTS,
 )
-from PySide6.QtCore import Qt, QThread, Signal, QUrl
+from PySide6.QtCore import Qt, QThread, Signal, QUrl, QTimer
+from updater import (download_verified, fetch_manifest,
+                     newer_version, schedule_exe_replacement)
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -34,7 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "YummyAnime Manager"
-APP_VERSION = "4.3.0"
+APP_VERSION = "4.4.0"
 YUMMY_API_BASE = "https://api.yani.tv"
 CVH_API_BASE = "https://plapi.cdnvideohub.com/api/v1/player/sv"
 
@@ -962,6 +964,39 @@ class WorkThread(QThread):
             self.failed.emit(str(e))
 
 
+class UpdateCheckThread(QThread):
+    available = Signal(object)
+    failed = Signal(str)
+
+    def run(self):
+        try:
+            manifest = fetch_manifest()
+            if newer_version(manifest["version"], APP_VERSION):
+                self.available.emit(manifest)
+        except Exception as error:
+            LOGGER.warning("Update check failed: %s", error)
+            self.failed.emit(str(error))
+
+
+class UpdateDownloadThread(QThread):
+    progress = Signal(int, str)
+    ready = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, asset, destination):
+        super().__init__()
+        self.asset = asset
+        self.destination = destination
+
+    def run(self):
+        try:
+            download_verified(self.asset, self.destination, self.progress.emit)
+            self.ready.emit(str(self.destination))
+        except Exception as error:
+            LOGGER.exception("Update download failed")
+            self.failed.emit(str(error))
+
+
 class SettingsDialog(QDialog):
     def __init__(self, parent, config):
         super().__init__(parent)
@@ -1006,6 +1041,8 @@ class SettingsDialog(QDialog):
         self.alloha_resolver.setPlaceholderText("http://127.0.0.1:8790")
         self.diagnostic_log = QCheckBox("Подробный журнал для диагностики ошибок")
         self.diagnostic_log.setChecked(bool(config.get("diagnostic_logging", False)))
+        self.auto_update = QCheckBox("Проверять обновления при запуске")
+        self.auto_update.setChecked(bool(config.get("auto_update", True)))
         open_logs = QPushButton("Открыть папку логов")
         open_logs.clicked.connect(self.open_log_folder)
 
@@ -1015,6 +1052,7 @@ class SettingsDialog(QDialog):
         form.addRow("ffmpeg.exe:", ff_row)
         form.addRow("Alloha resolver server:", self.alloha_resolver)
         form.addRow(self.diagnostic_log, open_logs)
+        form.addRow(self.auto_update)
         layout.addLayout(form)
 
         token_note = QLabel(
@@ -1056,6 +1094,7 @@ class SettingsDialog(QDialog):
             "ffmpeg_path": self.ffmpeg_path.text().strip(),
             "alloha_resolver_url": self.alloha_resolver.text().strip().rstrip("/"),
             "diagnostic_logging": self.diagnostic_log.isChecked(),
+            "auto_update": self.auto_update.isChecked(),
         }
 
 
@@ -1083,6 +1122,8 @@ class MainWindow(QMainWindow):
         self.work_thread = None
         self.quality_threads = []
         self.quality_probe_serial = 0
+        self.update_check_thread = None
+        self.update_download_thread = None
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -1095,7 +1136,7 @@ class MainWindow(QMainWindow):
         self.url_edit.setInsertPolicy(QComboBox.NoInsert)
         self.url_edit.addItems(self.config.get("url_history", [])[:10])
         self.url_edit.setCurrentIndex(-1)
-        self.url_edit.lineEdit().setPlaceholderText("https://ru.yummyani.me/catalog/item/parad-smerti")
+        self.url_edit.lineEdit().setPlaceholderText("Вставьте ссылку на страницу аниме")
         self.load_btn = QPushButton("Загрузить")
         self.settings_btn = QPushButton("Настройки")
         row.addWidget(self.url_edit, 1)
@@ -1231,6 +1272,44 @@ class MainWindow(QMainWindow):
         self.download_btn.clicked.connect(self.start_download)
 
         self.update_mkv_status()
+        if getattr(sys, "frozen", False) and self.config.get("auto_update", True):
+            QTimer.singleShot(0, self.check_for_updates)
+
+    def check_for_updates(self):
+        self.update_check_thread = UpdateCheckThread(self)
+        self.update_check_thread.available.connect(self.offer_update)
+        self.update_check_thread.start()
+
+    def offer_update(self, manifest):
+        answer = QMessageBox.question(
+            self, APP_NAME,
+            f"Доступна версия {manifest['version']}. Скачать и перезапустить приложение?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        current = Path(sys.executable)
+        destination = current.with_name(current.stem + ".new.exe")
+        self.current_status_label.setText("Скачиваю обновление…")
+        self.update_download_thread = UpdateDownloadThread(manifest["exe"], destination)
+        self.update_download_thread.progress.connect(
+            lambda percent, message: self.current_status_label.setText(f"Обновление: {message}"))
+        self.update_download_thread.ready.connect(
+            lambda path: self.apply_exe_update(path, manifest["exe"]["sha256"]))
+        self.update_download_thread.failed.connect(
+            lambda error: QMessageBox.warning(self, APP_NAME, f"Не удалось скачать обновление: {error}"))
+        self.update_download_thread.start()
+
+    def apply_exe_update(self, staged, digest):
+        try:
+            if self.update_download_thread is not None:
+                self.update_download_thread.wait(5000)
+            schedule_exe_replacement(sys.executable, staged, digest)
+        except Exception as error:
+            LOGGER.exception("Could not schedule update")
+            QMessageBox.warning(self, APP_NAME, f"Не удалось применить обновление: {error}")
+            return
+        QApplication.quit()
 
     def current_season(self):
         try: return int(self.season_combo.currentData())
@@ -1393,6 +1472,10 @@ class MainWindow(QMainWindow):
         self.player_combo.blockSignals(True)
         self.player_combo.clear()
         self.player_combo.addItems(sorted(self.player_map, key=str.casefold))
+        cvh_index = next((i for i in range(self.player_combo.count())
+                          if "cvh" in self.player_combo.itemText(i).casefold()), -1)
+        if cvh_index >= 0:
+            self.player_combo.setCurrentIndex(cvh_index)
         self.player_combo.blockSignals(False)
 
         self.rebuild_seasons()

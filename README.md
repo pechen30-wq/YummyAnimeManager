@@ -1,5 +1,7 @@
 # YummyAnime Manager
 
+**[Подробная инструкция по работе с программой](USER_GUIDE.md)**
+
 Windows-приложение для загрузки аниме по ссылке YummyAnime с выбором плеера,
 озвучек, сезона и реально доступного качества. Поддерживает multi-audio MKV,
 Plex-friendly naming и `.plexmatch`.
@@ -19,12 +21,13 @@ Plex-friendly naming и `.plexmatch`.
 - подробный журнал диагностики в настройках;
 - главы в MKV из исходного видео или метки OP/ED/recap из AniSkip;
 - Windows EXE с включённым Python runtime и FFmpeg.
+- автоматическая проверка обновлений при запуске EXE и BAT;
 
 ## Готовая Windows-версия
 
 Готовый файл находится в `dist/YummyAnimeManager.exe`.
 
-Это сборка PyInstaller версии 4.3.0. Для объединения озвучек нужен MKVToolNix.
+Это сборка PyInstaller версии 4.4.0. Для объединения озвучек нужен MKVToolNix.
 Настройки хранятся в `%USERPROFILE%\\.yummy_anime_manager` и не входят в репозиторий.
 
 ## Запуск из исходников
