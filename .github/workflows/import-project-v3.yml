@@ -16,15 +16,16 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Import prepared project
+      - name: Assemble and import project
         shell: bash
         run: |
           set -euo pipefail
+          cat .import3/parts/*.b64 | tr -d '\r\n' | base64 -d > project-source.zip
           rm -rf .import-unpack
           mkdir .import-unpack
-          unzip -q .import3/project-source.zip -d .import-unpack
+          unzip -q project-source.zip -d .import-unpack
           cp -a .import-unpack/YummyAnimeManager_project/. ./
-          rm -rf .import .import2 .import3 .import-unpack
+          rm -rf .import .import2 .import3 .import-unpack project-source.zip
           rm -f .github/workflows/import-project.yml
           rm -f .github/workflows/import-project-v2.yml
           rm -f .github/workflows/import-project-v3.yml
