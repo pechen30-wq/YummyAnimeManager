@@ -2,12 +2,12 @@
   "version": "4.4.0",
   "exe": {
     "url": "https://raw.githubusercontent.com/pechen30-wq/YummyAnimeManager/main/dist/YummyAnimeManager.exe",
-    "sha256": "66d89361ca7b7d8c7ffcab6a8261eb8bcc0f66061902691f292233ae22d61689",
-    "size": 83245284
+    "sha256": "6bdd333d2adf3d4e4d4b5144a5e37058713e5ceda7cc93cafaed44952104a941",
+    "size": 83245935
   },
   "source": {
     "url": "https://raw.githubusercontent.com/pechen30-wq/YummyAnimeManager/main/dist/source.zip",
-    "sha256": "7d2c4de0d3964624f0a78f59bb09beeba93d5863a48ab46a9321be622e7de412",
-    "size": 57910
+    "sha256": "7154ed4cab26f7f6f63152c6022b0f539239d33900ec8bad1179db26f429b102",
+    "size": 58287
   }
 }
