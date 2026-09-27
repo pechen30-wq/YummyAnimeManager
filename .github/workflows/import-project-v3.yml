@@ -1,0 +1,43 @@
+name: import-project-v3
+
+on:
+  push:
+    paths:
+      - ".import3/assemble.flag"
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Import prepared project
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .import-unpack
+          mkdir .import-unpack
+          unzip -q .import3/project-source.zip -d .import-unpack
+          cp -a .import-unpack/YummyAnimeManager_project/. ./
+          rm -rf .import .import2 .import3 .import-unpack
+          rm -f .github/workflows/import-project.yml
+          rm -f .github/workflows/import-project-v2.yml
+          rm -f .github/workflows/import-project-v3.yml
+
+      - name: Commit imported project
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+          else
+            git commit -m "Import YummyAnime Manager project"
+            git push
+          fi
