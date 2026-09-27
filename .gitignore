@@ -4,3 +4,4 @@ __pycache__/
 *.part
 build/
 *.spec
+dist/*.exe

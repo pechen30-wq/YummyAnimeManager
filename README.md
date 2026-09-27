@@ -15,15 +15,14 @@ Plex-friendly naming и `.plexmatch`.
 - Plex-структура `Название / Season XX / Название - SxxEyy.mkv`;
 - автоматический `.plexmatch`;
 - отдельный прогресс текущей серии и всей очереди;
-- Windows EXE, который сам разворачивает runtime и проверяет внешние компоненты.
+- Windows EXE с включённым Python runtime и FFmpeg.
 
 ## Готовая Windows-версия
 
 Готовый файл находится в `dist/YummyAnimeManager.exe`.
 
-При первом запуске EXE разворачивает runtime в `%LOCALAPPDATA%\\YummyAnimeManager`,
-проверяет FFmpeg и MKVToolNix и при необходимости предлагает установку. Настройки
-хранятся в `%USERPROFILE%\\.yummy_anime_manager` и не входят в репозиторий.
+Это сборка PyInstaller версии 4.2.1. Для объединения озвучек нужен MKVToolNix.
+Настройки хранятся в `%USERPROFILE%\\.yummy_anime_manager` и не входят в репозиторий.
 
 ## Запуск из исходников
 
@@ -49,8 +48,7 @@ python main.py
 build_exe.bat
 ```
 
-Это обычная PyInstaller-сборка исходного GUI. Готовый bootstrap EXE из `dist/`
-использует отдельный bootstrap-механизм, описанный в `docs/EXE_README.txt`.
+Команда создаёт ту же PyInstaller-сборку исходного GUI, что находится в `dist/`.
 
 ## Alloha
 
@@ -76,13 +74,6 @@ python -m unittest discover -s tests -v
 python test_resolvers.py
 python test_plexmatch.py
 ```
-
-## Обновления
-
-Bootstrap EXE уже умеет проверять HTTPS JSON manifest, загружать новую версию,
-проверять SHA-256 и заменять себя. Автообновление настроено на `update.json` в этом публичном репозитории. При запуске
-bootstrap EXE сравнивает версию, скачивает новый `dist/YummyAnimeManager.exe`,
-проверяет SHA-256 и перезапускается.
 
 ## Важное замечание
 
