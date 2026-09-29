@@ -41,18 +41,46 @@ def asset_identity(url):
     return url
 
 
-def media_playlist(url, headers):
+def attributes(line):
+    return {key: quoted if quoted else plain
+            for key, quoted, plain in re.findall(r'([A-Z0-9-]+)=(?:"([^"]*)"|([^,]*))', line)}
+
+
+def playlist_variant(body, audio_only=False):
+    variants = []
+    pending = None
+    tracks = []
+    for line in body.splitlines():
+        line = line.strip()
+        if line.startswith('#EXT-X-MEDIA:'):
+            track = attributes(line)
+            if track.get('TYPE') == 'AUDIO' and track.get('URI'):
+                tracks.append(track)
+        elif line.startswith('#EXT-X-STREAM-INF:'):
+            pending = attributes(line)
+        elif line and not line.startswith('#'):
+            variants.append((line, pending or {}))
+            pending = None
+    if not variants:
+        raise RuntimeError("Alloha: в плейлисте нет видеосегментов.")
+    if audio_only:
+        group = variants[-1][1].get('AUDIO')
+        matching = [track for track in tracks if not group or track.get('GROUP-ID') == group]
+        if matching:
+            return max(matching, key=lambda track: (track.get('DEFAULT') == 'YES',
+                                                     track.get('AUTOSELECT') == 'YES'))['URI']
+        # Muxed variants may carry different audio quality; keep the chosen stream.
+    return variants[-1][0]
+
+
+def media_playlist(url, headers, audio_only=False):
     for _ in range(4):
         body, url = fetch_playlist(url, headers)
         if "#EXTINF:" in body:
             if "#EXT-X-ENDLIST" not in body:
                 raise RuntimeError("Alloha вернул незавершённый список сегментов серии.")
             return body, url
-        variants = [line.strip() for line in body.splitlines()
-                    if line.strip() and not line.lstrip().startswith("#")]
-        if not variants:
-            raise RuntimeError("Alloha: в плейлисте нет видеосегментов.")
-        url = urllib.parse.urljoin(url, variants[-1])
+        url = urllib.parse.urljoin(url, playlist_variant(body, audio_only))
     raise RuntimeError("Alloha: слишком много вложенных плейлистов.")
 
 
@@ -71,11 +99,11 @@ def layout(body):
             for line in body.splitlines() if line.strip() and not line.startswith("#EXT-X-PROGRAM-DATE-TIME")]
 
 
-def stage_hls(url, cache, headers, progress, refresh=None):
+def stage_hls(url, cache, headers, progress, refresh=None, audio_only=False):
     """Reuse only fully downloaded assets; .part files are never fed to FFmpeg."""
     cache = Path(cache)
     cache.mkdir(parents=True, exist_ok=True)
-    body, url = media_playlist(url, headers)
+    body, url = media_playlist(url, headers, audio_only)
     signature = hashlib.sha256(repr(layout(body)).encode()).hexdigest()
     marker = cache / "layout.txt"
     if marker.is_file() and marker.read_text(encoding="ascii") != signature:
@@ -115,7 +143,7 @@ def stage_hls(url, cache, headers, progress, refresh=None):
                                 raise error
                             refreshes += 1
                             try:
-                                fresh_body, fresh_url = media_playlist(refresh(), headers)
+                                fresh_body, fresh_url = media_playlist(refresh(), headers, audio_only)
                                 break
                             except requests.HTTPError as expired:
                                 if expired.response.status_code not in (401, 403) or renewal == 2:

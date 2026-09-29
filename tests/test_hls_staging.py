@@ -8,6 +8,29 @@ from hls_download import stage_hls
 
 
 class HlsStagingTests(unittest.TestCase):
+    def test_audio_rendition_skips_video_playlist_and_segments(self):
+        master = ('#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="sound",'
+                  'NAME="Russian",DEFAULT=YES,URI="sound/index.m3u8"\n'
+                  '#EXT-X-STREAM-INF:BANDWIDTH=4000000,AUDIO="sound"\nvideo/index.m3u8\n')
+        audio = '#EXTM3U\n#EXTINF:6,\npart.aac\n#EXT-X-ENDLIST\n'
+        fetched = []
+        def fetch(url, headers):
+            fetched.append(url)
+            if url == 'https://example.com/master.m3u8':
+                return master, url
+            self.assertEqual(url, 'https://example.com/sound/index.m3u8')
+            return audio, url
+        def download(url, path, headers, progress):
+            fetched.append(url)
+            self.assertEqual(url, 'https://example.com/sound/part.aac')
+            path.write_bytes(b'audio')
+        with tempfile.TemporaryDirectory() as directory, \
+             patch('hls_download.fetch_playlist', side_effect=fetch), \
+             patch('hls_download.download_file', side_effect=download):
+            stage_hls('https://example.com/master.m3u8', directory, {},
+                      lambda *_: None, audio_only=True)
+        self.assertFalse(any('/video/' in url for url in fetched))
+
     def test_expired_links_are_refreshed_without_redownloading_completed_segments(self):
         old = "#EXTM3U\n#EXTINF:6,\nold/first.ts\n#EXTINF:6,\nold/last.ts\n#EXT-X-ENDLIST\n"
         new = old.replace("old/", "new/")

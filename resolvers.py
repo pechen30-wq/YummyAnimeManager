@@ -43,6 +43,7 @@ class StreamResult:
     quality: str = "auto"
     session: str = ""
     resolver_base: str = ""
+    audio_only: bool = False
 
     @property
     def is_manifest(self):

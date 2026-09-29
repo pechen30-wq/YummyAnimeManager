@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "YummyAnime Manager"
-APP_VERSION = "4.5.2"
+APP_VERSION = "4.5.3"
 YUMMY_API_BASE = "https://api.yani.tv"
 CVH_API_BASE = "https://plapi.cdnvideohub.com/api/v1/player/sv"
 
@@ -765,6 +765,12 @@ class WorkThread(QThread):
         self.progress.emit(series_pct,max(0,min(100,overall)),status)
     def resolve_stream(self,item, audio_only=False):
         result=self.resolver.resolve(item); label,url=choose_stream(result,"Лучшее" if audio_only else self.quality)
+        if audio_only:
+            # Preserve the master playlist's separate audio renditions.
+            master = (result.qualities or {}).get("auto") or result.url
+            if master and urllib.parse.urlparse(master).path.lower().endswith(".m3u8"):
+                url = master
+            result.audio_only = True
         result.url=url; result.quality=label; return result
     def ensure_chapters(self, media_path, item, episode, chapter_source=None):
         media_path=Path(media_path)
@@ -806,12 +812,13 @@ class WorkThread(QThread):
         return target
     @staticmethod
     def extension_for(result):
+        if result.audio_only: return ".mka"
         if result.is_manifest: return ".mkv"
         suffix=Path(urllib.parse.urlparse(result.url).path).suffix.lower()
         return suffix if suffix in RESOLVER_MEDIA_EXTS else ".mp4"
     def download_stream(self,result,path,item,progress_cb):
         path=Path(path); path.parent.mkdir(parents=True,exist_ok=True)
-        if result.source == "alloha" and urllib.parse.urlparse(result.url).path.lower().endswith(".m3u8"):
+        if result.source != "local_hls" and (result.source == "alloha" or result.audio_only) and urllib.parse.urlparse(result.url).path.lower().endswith(".m3u8"):
             source_key=hashlib.sha256(str(getattr(item,"iframe_url",result.url)).encode()).hexdigest()[:12]
             cache = path.parent / (".hls_" + path.stem + "_" + source_key)
             headers={"User-Agent":CHROME_UA}; headers.update(result.headers or {})
@@ -819,22 +826,29 @@ class WorkThread(QThread):
                 PlayerResolver.release(result)
                 fresh=self.resolver.resolve(item)
                 label,url=choose_stream(fresh,result.quality)
+                if result.audio_only:
+                    master=(fresh.qualities or {}).get("auto") or fresh.url
+                    if master and urllib.parse.urlparse(master).path.lower().endswith(".m3u8"):
+                        url=master
                 result.url=url; result.quality=label
                 result.session=fresh.session; result.resolver_base=fresh.resolver_base
                 result.headers=fresh.headers; result.qualities=fresh.qualities
                 headers.clear(); headers.update({"User-Agent":CHROME_UA}); headers.update(fresh.headers or {})
                 return url
             try:
-                playlist = stage_hls(result.url, cache, headers, progress_cb, refresh=refresh)
+                playlist = stage_hls(result.url, cache, headers, progress_cb,
+                                     refresh=refresh if result.source == "alloha" else None,
+                                     audio_only=result.audio_only)
             except requests.RequestException as error:
-                raise RuntimeError("Alloha: не удалось получить все видеосегменты серии.") from error
+                raise RuntimeError(f"{result.source}: не удалось получить все сегменты серии.") from error
             local = StreamResult(str(playlist), "local_hls", {}, {})
+            local.audio_only = result.audio_only
             self.download_stream(local, path, item,
                                  lambda pct, detail: progress_cb(90+int(pct/10), "Сборка видео · " + detail))
             if cache.resolve().parent == path.parent.resolve():
                 shutil.rmtree(cache)
             return
-        if result.is_manifest:
+        if result.is_manifest or result.audio_only:
             if not self.ffmpeg or not Path(self.ffmpeg).exists():
                 raise RuntimeError("Для HLS/DASH нужен FFmpeg. Откройте Настройки и укажите ffmpeg.exe.")
             headers=dict(result.headers or {})
@@ -879,6 +893,12 @@ class WorkThread(QThread):
                      "-progress","pipe:1","-protocol_whitelist","file,crypto,data",
                      "-allowed_extensions","ALL","-i",result.url,
                      "-map","0:v?","-map","0:a?","-map","0:s?","-c","copy",str(path)]
+            if result.audio_only:
+                input_position = cmd.index("-i")
+                cmd[input_position:input_position] = ["-discard:v", "all"]
+                input_end = cmd.index("-i") + 2
+                cmd = cmd[:input_end] + ["-map", "0:a", "-vn", "-sn", "-dn",
+                    "-map_metadata", "-1", "-map_chapters", "-1", "-c:a", "copy", str(path)]
             proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,
                 encoding="utf-8",errors="replace",bufsize=1,**hidden_subprocess_kwargs())
             errors=[]; last=-1; downloaded_seconds=0.0; missing_segment=False
