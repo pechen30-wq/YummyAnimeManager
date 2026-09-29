@@ -6,6 +6,7 @@ on:
     paths:
       - main.py
       - resolvers.py
+      - alloha_runtime.py
       - resilient_download.py
       - chapters.py
       - diagnostics.py

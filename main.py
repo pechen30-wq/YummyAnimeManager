@@ -37,7 +37,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "YummyAnime Manager"
-APP_VERSION = "4.4.1"
+APP_VERSION = "4.5.0"
 YUMMY_API_BASE = "https://api.yani.tv"
 CVH_API_BASE = "https://plapi.cdnvideohub.com/api/v1/player/sv"
 
@@ -648,17 +648,21 @@ def audio_track_ids(mkvmerge, media_path):
     return [t["id"] for t in info.get("tracks", []) if t.get("type") == "audio"]
 
 
-def merge_audio_tracks(mkvmerge, sources, output_path, progress_cb=None):
-    if len(sources) < 2:
+def merge_audio_tracks(mkvmerge, sources, output_path, progress_cb=None, video_source=None):
+    if len(sources) < 2 and video_source is None:
         raise RuntimeError("Для объединения нужно минимум две озвучки.")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     cmd=[mkvmerge,"--ui-language","en","-o",str(output_path)]
+    if video_source is not None:
+        cmd += ["--no-audio", str(video_source)]
     first_file,first_name=sources[0]
     first_audio=audio_track_ids(mkvmerge,first_file)
     if not first_audio: raise RuntimeError(f"Нет аудиодорожки в {first_file.name}")
     for idx,tid in enumerate(first_audio):
         cmd += ["--track-name",f"{tid}:{first_name}","--language",f"{tid}:rus",
                 "--default-track-flag",f"{tid}:{'yes' if idx==0 else 'no'}"]
+    if video_source is not None:
+        cmd += ["--no-video", "--no-subtitles", "--no-attachments", "--no-chapters"]
     cmd += [str(first_file)]
     for media_file,dub_name in sources[1:]:
         ids=audio_track_ids(mkvmerge,media_file)
@@ -755,8 +759,8 @@ class WorkThread(QThread):
         series_pct=max(0,min(100,int(series_pct)))
         overall=int((((ep_index-1)+series_pct/100.0)/max(1,total_eps))*100)
         self.progress.emit(series_pct,max(0,min(100,overall)),status)
-    def resolve_stream(self,item):
-        result=self.resolver.resolve(item); label,url=choose_stream(result,self.quality)
+    def resolve_stream(self,item, audio_only=False):
+        result=self.resolver.resolve(item); label,url=choose_stream(result,"Лучшее" if audio_only else self.quality)
         result.url=url; result.quality=label; return result
     def ensure_chapters(self, media_path, item, episode, chapter_source=None):
         media_path=Path(media_path)
@@ -867,15 +871,21 @@ class WorkThread(QThread):
             media_dir=title_dir/f"Season {self.season_number:02d}" if self.plex_structure else title_dir
             if self.plexmatch_enabled: write_plexmatch(title_dir,self.anime_metadata)
             errors=[]; completed=0; episodes=sorted(self.episode_items); total_eps=max(1,len(episodes))
-            use_merge=self.merge_enabled and len(self.dubbings)>1
+            cross_source = any(
+                items.get("__video__") is not None and
+                any(items.get(dub) != items["__video__"] for dub in self.dubbings)
+                for items in self.episode_items.values())
+            use_merge=(self.merge_enabled and len(self.dubbings)>1) or cross_source
             if use_merge and (not self.mkvmerge or not Path(self.mkvmerge).exists()):
                 raise RuntimeError("MKVToolNix не найден. Укажите путь к mkvmerge.exe в Настройках.")
-            download_part=90.0 if use_merge else 100.0; dub_span=download_part/max(1,len(self.dubbings))
+            download_part=90.0 if use_merge else 100.0
+            download_dubs = (["__video__"] if use_merge else []) + self.dubbings
+            dub_span=download_part/max(1,len(download_dubs))
             for ep_index,ep in enumerate(episodes,1):
                 LOGGER.info("Episode %s started",ep)
                 source_files=[]; ep_label=episode_label(ep); temp_dir=title_dir/".tmp"/f"episode_{safe_name(ep_label)}"; failed=False
                 self.emit_progress(ep_index,total_eps,0,f"Серия {ep_label} ({ep_index}/{len(episodes)}): подготовка…")
-                for dub_index,dub in enumerate(self.dubbings,1):
+                for dub_index,dub in enumerate(download_dubs,1):
                     item=self.episode_items[ep].get(dub); dub_start=(dub_index-1)*dub_span
                     self.emit_progress(ep_index,total_eps,dub_start,f"Серия {ep_label} ({ep_index}/{len(episodes)}): {dub} — получение прямой ссылки…")
                     if not item: errors.append(f"Серия {ep_label}: нет озвучки «{dub}»."); failed=True; break
@@ -898,7 +908,7 @@ class WorkThread(QThread):
                                 )
                                 time.sleep(0.8 * (attempt - 1))
 
-                            stream = self.resolve_stream(item)
+                            stream = self.resolve_stream(item, audio_only=use_merge and dub != "__video__")
                             LOGGER.info("Resolved episode=%s dubbing=%s provider=%s quality=%s URL=%s",
                                         ep,dub,stream.source,stream.quality,safe_url(stream.url))
                             ext = self.extension_for(stream)
@@ -964,9 +974,10 @@ class WorkThread(QThread):
                     self.emit_progress(ep_index,total_eps,90,f"Серия {ep_label} ({ep_index}/{len(episodes)}): объединение {len(source_files)} озвучек в MKV…")
                     try:
                         def mp(pct): self.emit_progress(ep_index,total_eps,90+pct*0.10,f"Серия {ep_label} ({ep_index}/{len(episodes)}): MKVToolNix — {pct}%")
-                        merge_audio_tracks(self.mkvmerge,source_files,output,progress_cb=mp); completed+=1
+                        merge_audio_tracks(self.mkvmerge,source_files[1:],output,progress_cb=mp,
+                                           video_source=source_files[0][0]); completed+=1
                         try:
-                            first_item=self.episode_items[ep].get(self.dubbings[0])
+                            first_item=self.episode_items[ep].get("__video__") or self.episode_items[ep].get(self.dubbings[0])
                             self.ensure_chapters(output,first_item,ep,chapter_source=source_files[0][0])
                         except Exception as chapter_error:
                             LOGGER.exception("Chapter processing failed for merged episode=%s",ep)
@@ -1081,7 +1092,7 @@ class SettingsDialog(QDialog):
         token_note = QLabel(
             "Приватный токен YummyAnime не нужен. Kodik/CVH/Aksor/Sibnet/Rutube/VK/Zedfilm "
             "обрабатываются встроенными resolver-ами. Alloha требует официальный self-hosted "
-            "YummyAnime resolver server; установщик лежит рядом с программой."
+            "YummyAnime resolver server. Локальный resolver устанавливается и запускается автоматически."
         )
         token_note.setWordWrap(True)
         layout.addWidget(token_note)
@@ -1182,7 +1193,7 @@ class MainWindow(QMainWindow):
         self.season_combo = QComboBox()
         self.season_combo.setMinimumWidth(130)
         self.season_combo.addItem("Сезон 1", 1)
-        selector.addWidget(QLabel("Плеер:")); selector.addWidget(self.player_combo, 1); selector.addSpacing(20)
+        selector.addWidget(QLabel("Источник видео:")); selector.addWidget(self.player_combo, 1); selector.addSpacing(20)
         selector.addWidget(QLabel("Качество:")); selector.addWidget(self.quality_combo); selector.addSpacing(20)
         selector.addWidget(QLabel("Сезон:")); selector.addWidget(self.season_combo)
         layout.addLayout(selector)
@@ -1238,8 +1249,8 @@ class MainWindow(QMainWindow):
         # merge
         merge_box = QGroupBox("MKV и озвучки")
         merge_layout = QVBoxLayout(merge_box)
-        self.merge_check = QCheckBox("Объединить озвучки в один MKV")
-        self.merge_check.setToolTip("Видео берётся из первой выбранной озвучки; нужен MKVToolNix.")
+        self.merge_check = QCheckBox("Собрать видео и выбранные озвучки в MKV")
+        self.merge_check.setToolTip("Видео берётся из выбранного плеера, аудио — из любых плееров; нужен MKVToolNix.")
         self.merge_check.setChecked(True)
         self.keep_sources = QCheckBox("Сохранять исходные файлы после сборки MKV")
         self.chapters_check = QCheckBox("Добавлять главы из видео или AniSkip")
@@ -1352,7 +1363,7 @@ class MainWindow(QMainWindow):
         try: return int(self.season_combo.currentData())
         except Exception: return infer_season_from_title(self.anime)
     def available_seasons_for_player(self):
-        items=self.player_map.get(self.player_combo.currentText(),[])
+        items=self.videos
         explicit=sorted({int(v.season_hint) for v in items if v.season_hint is not None})
         return explicit or [infer_season_from_title(self.anime)]
     def rebuild_seasons(self):
@@ -1365,7 +1376,10 @@ class MainWindow(QMainWindow):
     def player_items_for_current_season(self):
         items=list(self.player_map.get(self.player_combo.currentText(),[])); explicit=[x for x in items if x.season_hint is not None]
         return [x for x in items if x.season_hint==self.current_season()] if explicit else items
-    def on_player_changed(self): self.rebuild_seasons(); self.rebuild_dubbings()
+    def all_items_for_current_season(self):
+        return [v for v in self.videos if v.season_hint is None or v.season_hint == self.current_season()]
+    def on_player_changed(self):
+        self.update_source_status(); self.rebuild_episodes()
     def on_season_changed(self): self.rebuild_dubbings()
     def schedule_quality_probe(self):
         selected=self.selected_dubbings(); matrix=self.episode_matrix(); common=[ep for ep,dubs in matrix.items() if all(d in dubs for d in selected)]
@@ -1374,7 +1388,7 @@ class MainWindow(QMainWindow):
         self.quality_status.setText("Проверяю реальные качества выбранного источника…")
         if not selected or not common:
             self.quality_combo.clear(); self.quality_combo.addItem("Нет доступных серий",None); self.quality_status.setText(""); return
-        ep=sorted(common)[0]; items=[matrix[ep][d] for d in selected if d in matrix[ep]]
+        ep=sorted(common)[0]; items=[matrix[ep]["__video__"]]
         thread=QualityProbeThread(serial,self.config,items); self.quality_threads.append(thread); thread.done.connect(self.on_quality_probe_done)
         def cleanup():
             try: self.quality_threads.remove(thread)
@@ -1526,7 +1540,7 @@ class MainWindow(QMainWindow):
         self.dub_list.blockSignals(True)
         self.dub_list.clear()
 
-        dubbings = sorted({v.dubbing for v in self.player_items_for_current_season()}, key=str.casefold)
+        dubbings = sorted({v.dubbing for v in self.all_items_for_current_season()}, key=str.casefold)
 
         for i, dub in enumerate(dubbings):
             item = QListWidgetItem(dub)
@@ -1547,12 +1561,19 @@ class MainWindow(QMainWindow):
     def episode_matrix(self):
         selected = self.selected_dubbings()
         matrix = defaultdict(dict)
-
-        for v in self.player_items_for_current_season():
+        priority = {"cvh": 0, "kodik": 1, "sibnet": 2, "alloha": 3, "aksor": 4}
+        items = sorted(self.all_items_for_current_season(),
+                       key=lambda v: (priority.get(provider_kind(v), 5), v.player, v.video_id))
+        for v in items:
             if v.dubbing in selected:
-                matrix[v.episode_key][v.dubbing] = v
-
-        return matrix
+                matrix[v.episode_key].setdefault(v.dubbing, v)
+        for v in self.player_items_for_current_season():
+            # Video is independent of which audio studios were selected.
+            matrix[v.episode_key].setdefault("__video__", v)
+            if selected and v.dubbing == selected[0]:
+                matrix[v.episode_key]["__video__"] = v
+                matrix[v.episode_key][selected[0]] = v
+        return {ep: dubs for ep, dubs in matrix.items() if "__video__" in dubs}
 
     def rebuild_episodes(self):
         self.ep_list.blockSignals(True)
@@ -1583,11 +1604,11 @@ class MainWindow(QMainWindow):
             self.ep_list.addItem(item)
 
         self.ep_list.blockSignals(False)
-        self.merge_check.setEnabled(len(selected) > 1)
-        if len(selected) <= 1:
-            self.merge_check.setChecked(False)
-        else:
-            self.merge_check.setChecked(True)
+        requires_mux = any(
+            any(matrix[ep][dub] != matrix[ep]["__video__"] for dub in selected)
+            for ep in common)
+        self.merge_check.setEnabled(len(selected) > 1 and not requires_mux)
+        self.merge_check.setChecked(requires_mux or len(selected) > 1)
 
         self.statusBar().showMessage(
             f"Выбрано озвучек: {len(selected)} · общих серий: {len(common)}"
@@ -1627,12 +1648,15 @@ class MainWindow(QMainWindow):
         selected_matrix = {ep: matrix[ep] for ep in episodes if ep in matrix}
 
         do_merge = self.merge_check.isChecked() and len(dubbings) > 1
+        do_merge = do_merge or any(
+            any(items[dub] != items["__video__"] for dub in dubbings)
+            for items in selected_matrix.values())
         if do_merge:
             mkv = self.config.get("mkvmerge_path", "")
             if not mkv or not Path(mkv).exists():
                 QMessageBox.warning(
                     self, APP_NAME,
-                    "Для объединения нескольких озвучек нужен mkvmerge.exe.\n"
+                    "Для сборки видео и аудиодорожек из разных источников нужен mkvmerge.exe.\n"
                     "Откройте Настройки и укажите путь к MKVToolNix."
                 )
                 return

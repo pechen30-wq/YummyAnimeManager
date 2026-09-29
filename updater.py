@@ -25,7 +25,7 @@ VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 
 SOURCE_FILES = (
-    "main.py", "resolvers.py", "resilient_download.py", "chapters.py",
+    "main.py", "resolvers.py", "alloha_runtime.py", "resilient_download.py", "chapters.py",
     "diagnostics.py", "url_history.py", "updater.py", "update_source.py",
     "requirements.txt", "VERSION", "README.md", "CHANGELOG.md",
     "NOTICE.md", "SECURITY.md", "build_exe.bat", "install.bat",

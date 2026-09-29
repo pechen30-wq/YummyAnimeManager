@@ -885,9 +885,11 @@ class PlayerResolver:
         return StreamResult(candidates[label], "zedfilm", candidates, {"Referer": full_url, "Origin": "https://hlamer.ru", "User-Agent": CHROME_UA}, label)
 
     def resolve_alloha(self, item):
+        from alloha_runtime import ensure_resolver
         base = str(self.config.get("alloha_resolver_url") or "").strip().rstrip("/")
         if not base:
             raise RuntimeError("Alloha требует YummyAnime resolver server. Укажите адрес в Настройках.")
+        ensure_resolver(base)
         try:
             r = requests.get(base + "/resolve", params={"url": item.iframe_url}, timeout=45)
             r.raise_for_status()

@@ -27,7 +27,7 @@ Plex-friendly naming и `.plexmatch`.
 
 Готовый файл находится в `dist/YummyAnimeManager.exe`.
 
-Это сборка PyInstaller версии 4.4.1. Для объединения озвучек нужен MKVToolNix.
+Это сборка PyInstaller версии 4.5.0. Для объединения озвучек нужен MKVToolNix.
 Настройки хранятся в `%USERPROFILE%\\.yummy_anime_manager` и не входят в репозиторий.
 
 ## Запуск из исходников
@@ -58,14 +58,21 @@ build_exe.bat
 
 ## Alloha
 
-Для Alloha требуется официальный self-hosted resolver:
+Локальный официальный Alloha resolver устанавливается и запускается автоматически
+при первом обращении к Alloha. Приложение скачивает resolver, Chromium и, если
+нужно, переносной Node.js LTS в `%USERPROFILE%\.yummy_anime_manager\runtime`.
+Первая установка требует Интернета и может занять несколько минут; интерфейс
+остаётся доступным. Логи установки и запуска находятся в папке `logs`.
+Удалённый адрес resolver-а из настроек обслуживается пользователем.
+
+Ручная установка также доступна:
 
 ```bat
 install_alloha_resolver.bat
 start_alloha_resolver.bat
 ```
 
-Нужен Node.js LTS. По умолчанию приложение ожидает resolver по адресу
+Для ручной установки нужен Node.js LTS. По умолчанию resolver использует адрес
 `http://127.0.0.1:8790`.
 
 ## Токен YummyAnime
