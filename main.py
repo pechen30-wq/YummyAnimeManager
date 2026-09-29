@@ -37,7 +37,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "YummyAnime Manager"
-APP_VERSION = "4.5.0"
+APP_VERSION = "4.5.1"
 YUMMY_API_BASE = "https://api.yani.tv"
 CVH_API_BASE = "https://plapi.cdnvideohub.com/api/v1/player/sv"
 
@@ -824,10 +824,11 @@ class WorkThread(QThread):
             if proxy:
                 cmd += ["-http_proxy", proxy]
 
+            # EOF is normal for finite HLS/DASH manifests and media segments.
+            # Reconnecting there prevents manifest parsing from ever finishing.
             cmd += [
                 "-rw_timeout", "30000000",
                 "-reconnect", "1",
-                "-reconnect_at_eof", "1",
                 "-reconnect_on_network_error", "1",
                 "-reconnect_on_http_error", "5xx",
                 "-reconnect_streamed", "1",
