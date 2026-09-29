@@ -3,6 +3,7 @@ import sys
 import re
 import os
 import json
+import hashlib
 import shutil
 import subprocess
 import tempfile
@@ -16,6 +17,7 @@ from typing import Any
 
 import requests
 from resilient_download import download_file
+from hls_download import stage_hls
 from chapters import aniskip_points, inspect_media, remux_to_mkv
 from diagnostics import LOGGER, LOG_DIR, configure_logging, install_exception_hooks, safe_url
 from url_history import remember_url
@@ -37,7 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "YummyAnime Manager"
-APP_VERSION = "4.5.1"
+APP_VERSION = "4.5.2"
 YUMMY_API_BASE = "https://api.yani.tv"
 CVH_API_BASE = "https://plapi.cdnvideohub.com/api/v1/player/sv"
 
@@ -727,7 +729,9 @@ class QualityProbeThread(QThread):
                 LOGGER.exception("Quality probe failed for dubbing=%s", getattr(item, 'dubbing', ''))
                 notes.append(f"{getattr(item,'dubbing','')}: {e}")
             finally:
-                if stream is not None: PlayerResolver.release(stream)
+                # Alloha shares one session per iframe with active downloads.
+                # Probing must not close it; the server expires idle sessions.
+                if stream is not None and stream.source != "alloha": PlayerResolver.release(stream)
         if sets:
             common=set.intersection(*sets)
             numeric=sorted([x for x in common if re.search(r"\d{3,4}",x)],
@@ -807,13 +811,36 @@ class WorkThread(QThread):
         return suffix if suffix in RESOLVER_MEDIA_EXTS else ".mp4"
     def download_stream(self,result,path,item,progress_cb):
         path=Path(path); path.parent.mkdir(parents=True,exist_ok=True)
+        if result.source == "alloha" and urllib.parse.urlparse(result.url).path.lower().endswith(".m3u8"):
+            source_key=hashlib.sha256(str(getattr(item,"iframe_url",result.url)).encode()).hexdigest()[:12]
+            cache = path.parent / (".hls_" + path.stem + "_" + source_key)
+            headers={"User-Agent":CHROME_UA}; headers.update(result.headers or {})
+            def refresh():
+                PlayerResolver.release(result)
+                fresh=self.resolver.resolve(item)
+                label,url=choose_stream(fresh,result.quality)
+                result.url=url; result.quality=label
+                result.session=fresh.session; result.resolver_base=fresh.resolver_base
+                result.headers=fresh.headers; result.qualities=fresh.qualities
+                headers.clear(); headers.update({"User-Agent":CHROME_UA}); headers.update(fresh.headers or {})
+                return url
+            try:
+                playlist = stage_hls(result.url, cache, headers, progress_cb, refresh=refresh)
+            except requests.RequestException as error:
+                raise RuntimeError("Alloha: не удалось получить все видеосегменты серии.") from error
+            local = StreamResult(str(playlist), "local_hls", {}, {})
+            self.download_stream(local, path, item,
+                                 lambda pct, detail: progress_cb(90+int(pct/10), "Сборка видео · " + detail))
+            if cache.resolve().parent == path.parent.resolve():
+                shutil.rmtree(cache)
+            return
         if result.is_manifest:
             if not self.ffmpeg or not Path(self.ffmpeg).exists():
                 raise RuntimeError("Для HLS/DASH нужен FFmpeg. Откройте Настройки и укажите ffmpeg.exe.")
             headers=dict(result.headers or {})
             cmd=[self.ffmpeg,"-y","-hide_banner","-loglevel",
                  "info" if LOGGER.isEnabledFor(10) else "error","-nostats","-progress","pipe:1"]
-            ua=headers.pop("User-Agent",headers.pop("user-agent",""))
+            ua=headers.pop("User-Agent",headers.pop("user-agent",CHROME_UA))
             if ua:
                 cmd += ["-user_agent", ua]
             if headers:
@@ -823,6 +850,11 @@ class WorkThread(QThread):
             proxy = system_proxy_for(result.url)
             if proxy:
                 cmd += ["-http_proxy", proxy]
+
+            if urllib.parse.urlparse(result.url).path.lower().endswith(".m3u8"):
+                cmd += ["-seg_max_retry", "3"]
+                if result.source == "alloha":
+                    cmd += ["-http_persistent", "0", "-http_multiple", "0"]
 
             # EOF is normal for finite HLS/DASH manifests and media segments.
             # Reconnecting there prevents manifest parsing from ever finishing.
@@ -842,12 +874,21 @@ class WorkThread(QThread):
             try: duration=float(getattr(item,"duration",0) or 0)
             except Exception: duration=0.0
             if duration<=0: duration=estimate_manifest_duration(result)
+            if result.source == "local_hls":
+                cmd=[self.ffmpeg,"-y","-hide_banner","-loglevel","error","-nostats",
+                     "-progress","pipe:1","-protocol_whitelist","file,crypto,data",
+                     "-allowed_extensions","ALL","-i",result.url,
+                     "-map","0:v?","-map","0:a?","-map","0:s?","-c","copy",str(path)]
             proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,
                 encoding="utf-8",errors="replace",bufsize=1,**hidden_subprocess_kwargs())
-            errors=[]; last=-1
+            errors=[]; last=-1; downloaded_seconds=0.0; missing_segment=False
             for line in proc.stdout or []:
                 line=line.strip(); seconds=None
                 LOGGER.debug("FFmpeg: %s",line)
+                if re.search(r"Segment .*failed too many times, skipping", line, re.I):
+                    missing_segment=True
+                    proc.kill()
+                    break
                 if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
                     try: seconds=float(line.split("=",1)[1])/1_000_000.0
                     except Exception: pass
@@ -857,10 +898,15 @@ class WorkThread(QThread):
                     except Exception: pass
                 elif line and "=" not in line: errors.append(line)
                 if seconds is not None and duration>0:
+                    downloaded_seconds=max(downloaded_seconds,seconds)
                     pct=max(0,min(99,int(seconds*100/duration)))
                     if pct!=last: progress_cb(pct,f"{pct}%"); last=pct
             code=proc.wait()
+            if missing_segment:
+                raise RuntimeError("Источник не отдал видеосегмент. Неполная серия не будет сохранена как готовая.")
             if code!=0: raise RuntimeError("\n".join(errors[-12:]) or "FFmpeg завершился с ошибкой.")
+            if duration>0 and downloaded_seconds < duration-max(2.0,duration*0.02):
+                raise RuntimeError(f"Видео скачано не полностью: {downloaded_seconds:.1f} из {duration:.1f} секунд.")
             progress_cb(100,"100%"); return
         headers={"User-Agent":CHROME_UA}; headers.update(result.headers or {})
         download_file(result.url, path, headers, progress_cb)
@@ -890,11 +936,19 @@ class WorkThread(QThread):
                     item=self.episode_items[ep].get(dub); dub_start=(dub_index-1)*dub_span
                     self.emit_progress(ep_index,total_eps,dub_start,f"Серия {ep_label} ({ep_index}/{len(episodes)}): {dub} — получение прямой ссылки…")
                     if not item: errors.append(f"Серия {ep_label}: нет озвучки «{dub}»."); failed=True; break
-                    provider = provider_kind(item)
-                    max_attempts = 3 if provider == "aksor" else 1
+                    if use_merge and dub != "__video__" and item == self.episode_items[ep].get("__video__"):
+                        source_files.append((source_files[0][0],dub))
+                        continue
+                    candidates = ([item] if dub == "__video__" else
+                                  self.episode_items[ep].get("__audio_candidates__", {}).get(dub, [item]))
+                    attempt_items = [candidate for candidate in candidates
+                                     for _ in range(3 if provider_kind(candidate) in ("aksor", "alloha") else 2)]
+                    max_attempts = len(attempt_items)
                     last_error = None
 
                     for attempt in range(1, max_attempts + 1):
+                        item = attempt_items[attempt-1]
+                        provider = provider_kind(item)
                         stream = None
                         dest = None
                         try:
@@ -904,7 +958,7 @@ class WorkThread(QThread):
                                     total_eps,
                                     dub_start,
                                     f"Серия {ep_label} ({ep_index}/{len(episodes)}): "
-                                    f"{dub} · Aksor — CDN недоступен, получаю новую ссылку "
+                                    f"{dub} · {provider_label(item)} — обновляю источник "
                                     f"(попытка {attempt}/{max_attempts})…",
                                 )
                                 time.sleep(0.8 * (attempt - 1))
@@ -956,7 +1010,7 @@ class WorkThread(QThread):
                             last_error = e
                             LOGGER.exception("Download attempt failed: episode=%s dubbing=%s attempt=%s/%s",
                                              ep,dub,attempt,max_attempts)
-                            if provider != "aksor" or attempt >= max_attempts:
+                            if attempt >= max_attempts:
                                 break
                         finally:
                             if stream is not None:
@@ -1568,12 +1622,19 @@ class MainWindow(QMainWindow):
         for v in items:
             if v.dubbing in selected:
                 matrix[v.episode_key].setdefault(v.dubbing, v)
+                matrix[v.episode_key].setdefault("__audio_candidates__", {}).setdefault(v.dubbing, []).append(v)
         for v in self.player_items_for_current_season():
             # Video is independent of which audio studios were selected.
             matrix[v.episode_key].setdefault("__video__", v)
             if selected and v.dubbing == selected[0]:
                 matrix[v.episode_key]["__video__"] = v
                 matrix[v.episode_key][selected[0]] = v
+        for dubs in matrix.values():
+            video = dubs.get("__video__")
+            if video and video.dubbing in selected:
+                dubs[video.dubbing] = video
+                candidates = dubs["__audio_candidates__"][video.dubbing]
+                dubs["__audio_candidates__"][video.dubbing] = [video] + [v for v in candidates if v != video]
         return {ep: dubs for ep, dubs in matrix.items() if "__video__" in dubs}
 
     def rebuild_episodes(self):

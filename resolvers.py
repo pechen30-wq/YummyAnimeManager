@@ -159,6 +159,9 @@ def _request(session, method, url, **kwargs):
 
 def system_proxy_for(url="https://example.com/"):
     """Return system/environment HTTP proxy for FFmpeg, if configured."""
+    hostname = urllib.parse.urlparse(str(url or "")).hostname or ""
+    if hostname in ("localhost", "127.0.0.1", "::1") or urllib.request.proxy_bypass(hostname):
+        return ""
     try:
         proxies = urllib.request.getproxies() or {}
     except Exception:

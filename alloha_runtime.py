@@ -90,12 +90,32 @@ def hidden():
     return {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
 
 
+def patch_stream_errors(server):
+    """Keep the pinned upstream server alive when a CDN stream is reset."""
+    entry = Path(server) / "index.js"
+    if not entry.is_file():
+        return
+    source = entry.read_text(encoding="utf-8")
+    old = "Readable.fromWeb(upstream.body).pipe(response);"
+    new = """const stream = Readable.fromWeb(upstream.body);
+    stream.on('error', (error) => {
+        log(`upstream stream failed: ${error.message}`);
+        response.destroy();
+    });
+    response.on('error', () => stream.destroy());
+    response.on('close', () => stream.destroy());
+    stream.pipe(response);"""
+    if old in source:
+        entry.write_text(source.replace(old, new), encoding="utf-8")
+
+
 def ensure_resolver(base):
     """Remote URLs are user-managed; only plain HTTP loopback is auto-started."""
     global PROCESS
     parsed = urllib.parse.urlsplit(base)
     if parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost") or parsed.path not in ("", "/"):
         return
+    patch_stream_errors(ROOT / "alloha-resolver")
     if healthy(base):
         return
     with LOCK:
@@ -140,6 +160,7 @@ def ensure_resolver(base):
             if result.returncode:
                 raise RuntimeError(f"Не удалось установить Alloha resolver. Подробности: {log_dir / 'alloha-install.log'}")
             marker.write_text(REVISION, encoding="utf-8")
+        patch_stream_errors(server)
         log_dir = ROOT.parent / "logs"
         log_dir.mkdir(exist_ok=True)
         with (log_dir / "alloha-resolver.log").open("a", encoding="utf-8") as log:

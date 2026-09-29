@@ -21,6 +21,12 @@ class QuietHandler(http.server.SimpleHTTPRequestHandler):
 
 class HlsDownloadTests(unittest.TestCase):
     def test_finite_hls_download_starts_and_finishes(self):
+        self.download_hls(missing=False)
+
+    def test_missing_segment_is_not_reported_as_a_success(self):
+        self.download_hls(missing=True)
+
+    def download_hls(self, missing):
         ffmpeg = find_ffmpeg()
         self.assertTrue(ffmpeg)
         with tempfile.TemporaryDirectory() as directory:
@@ -31,6 +37,9 @@ class HlsDownloadTests(unittest.TestCase):
                 "sine=frequency=440:duration=2", "-c:v", "libx264", "-c:a", "aac",
                 "-f", "hls", "-hls_time", "1", "-hls_list_size", "0",
                 str(root / "video.m3u8")], check=True, timeout=20)
+            if missing:
+                for segment in root.glob("*.ts"):
+                    segment.unlink()
             handler = functools.partial(QuietHandler, directory=directory)
             server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -55,11 +64,20 @@ class HlsDownloadTests(unittest.TestCase):
 
             try:
                 with patch("main.subprocess.Popen", side_effect=bounded_popen):
-                    worker.download_stream(stream, root / "output.mkv",
-                                           SimpleNamespace(duration=2),
-                                           lambda pct, _: progress.append(pct))
+                    if missing:
+                        with self.assertRaises(RuntimeError):
+                            worker.download_stream(stream, root / "output.mkv",
+                                                   SimpleNamespace(duration=2),
+                                                   lambda pct, _: progress.append(pct))
+                    else:
+                        worker.download_stream(stream, root / "output.mkv",
+                                               SimpleNamespace(duration=2),
+                                               lambda pct, _: progress.append(pct))
             finally:
                 for timer in timers:
                     timer.cancel()
-            self.assertGreater((root / "output.mkv").stat().st_size, 1000)
-            self.assertEqual(progress[-1], 100)
+            if missing:
+                self.assertNotIn(100, progress)
+            else:
+                self.assertGreater((root / "output.mkv").stat().st_size, 1000)
+                self.assertEqual(progress[-1], 100)

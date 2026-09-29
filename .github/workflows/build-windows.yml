@@ -8,6 +8,7 @@ on:
       - resolvers.py
       - alloha_runtime.py
       - resilient_download.py
+      - hls_download.py
       - chapters.py
       - diagnostics.py
       - url_history.py

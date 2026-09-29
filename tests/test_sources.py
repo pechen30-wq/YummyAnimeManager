@@ -65,8 +65,78 @@ class SourceTests(unittest.TestCase):
             self.assertEqual(cmd[cmd.index(str(root / "video.mkv")) - 1], "--no-audio")
             self.assertIn("--no-video", cmd)
 
+    def test_audio_falls_back_after_provider_error(self):
+        from main import WorkThread, VideoItem
+        from resolvers import StreamResult
+        video = VideoItem(1, "Alloha", "Video voice", "1", 1, "")
+        bad = VideoItem(2, "Kodik", "Voice", "1", 1, "")
+        good = VideoItem(3, "CVH", "Voice", "1", 1, "")
+        seen = []
+        def resolve(item, **kwargs):
+            seen.append(item.player)
+            if item == bad:
+                raise RuntimeError("HTTP 500")
+            return StreamResult("https://example.com/video.mp4", "direct", {}, {})
+        def download(stream, path, item, progress):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"media")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mkv = root / "mkvmerge.exe"
+            mkv.touch()
+            matrix = {1.0: {"__video__": video, "Voice": bad,
+                            "__audio_candidates__": {"Voice": [bad, good]}}}
+            worker = WorkThread("Alloha", ["Voice"], matrix, "1080p", root,
+                                "Test", True, str(mkv), False,
+                                plexmatch_enabled=False, chapters_enabled=False)
+            results = []
+            worker.done.connect(lambda summary, errors: results.append((summary, errors)))
+            with patch.object(worker, "resolve_stream", side_effect=resolve), \
+                 patch.object(worker, "download_stream", side_effect=download), \
+                 patch("main.PlayerResolver.release"), patch("main.merge_audio_tracks"):
+                worker.run()
+            self.assertEqual(seen, ["Alloha", "Kodik", "Kodik", "CVH"])
+            self.assertEqual(results[0][1], [])
+            self.assertIn("Обработано серий: 1", results[0][0])
+
+    def test_short_video_with_success_exit_code_is_rejected(self):
+        from main import WorkThread, find_ffmpeg
+        from resolvers import StreamResult
+        from types import SimpleNamespace
+        process = MagicMock()
+        process.stdout = ["out_time_us=306005333\n", "progress=end\n"]
+        process.wait.return_value = 0
+        worker = WorkThread("Alloha", ["Voice"], {}, "1080p", ".", "Test",
+                            False, "", False, ffmpeg_path=find_ffmpeg())
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("main.subprocess.Popen", return_value=process):
+            with self.assertRaisesRegex(RuntimeError, "не полностью"):
+                worker.download_stream(StreamResult("http://localhost/video.m3u8", "cvh", {}, {}),
+                                       Path(directory)/"video.mkv", SimpleNamespace(duration=1552),
+                                       lambda *_: None)
+
 
 class RuntimeTests(unittest.TestCase):
+    def test_resolver_stream_error_patch_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            entry = Path(directory) / "index.js"
+            entry.write_text("Readable.fromWeb(upstream.body).pipe(response);", encoding="utf-8")
+            alloha_runtime.patch_stream_errors(directory)
+            patched = entry.read_text(encoding="utf-8")
+            self.assertIn("stream.on('error'", patched)
+            self.assertIn("response.destroy()", patched)
+            alloha_runtime.patch_stream_errors(directory)
+            self.assertEqual(entry.read_text(encoding="utf-8"), patched)
+
+    def test_quality_probe_does_not_close_active_alloha_session(self):
+        from main import QualityProbeThread
+        from resolvers import StreamResult
+        stream = StreamResult("url", "alloha", {"1080p": "url"}, {}, session="shared")
+        with patch("main.PlayerResolver.resolve", return_value=stream), \
+             patch("main.PlayerResolver.release") as release:
+            QualityProbeThread(1, {}, [object()]).run()
+        release.assert_not_called()
+
     def test_remote_resolver_is_not_installed_locally(self):
         with patch.object(alloha_runtime, "node_runtime") as node:
             alloha_runtime.ensure_resolver("https://resolver.example.com")
