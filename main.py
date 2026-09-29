@@ -8,15 +8,17 @@ import shutil
 import subprocess
 import tempfile
 import time
+import threading
 import random
 import urllib.parse
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from collections import defaultdict
 from typing import Any
 
 import requests
-from resilient_download import download_file, download_ranges, RangeUnsupportedError, RangeDownloadError
+from resilient_download import (download_file, download_ranges, RangeUnsupportedError,
+                                RangeDownloadError, DownloadControl, PauseDownload, StopDownload)
 from hls_download import stage_hls
 from chapters import aniskip_points, inspect_media, remux_to_mkv
 from diagnostics import LOGGER, LOG_DIR, configure_logging, install_exception_hooks, safe_url
@@ -39,12 +41,13 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "YummyAnime Manager"
-APP_VERSION = "4.5.9"
+APP_VERSION = "4.6.0"
 YUMMY_API_BASE = "https://api.yani.tv"
 CVH_API_BASE = "https://plapi.cdnvideohub.com/api/v1/player/sv"
 
 CONFIG_DIR = Path.home() / ".yummy_anime_manager"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+CHECKPOINT_FILE = CONFIG_DIR / "pending-download.json"
 
 QUALITY_KEYS = {
     144: "mpegTinyUrl",
@@ -90,6 +93,116 @@ class VideoItem:
     def is_cvh(self):
         s = f"{self.player} {self.iframe_url}".lower()
         return "cvh" in s or "cdnvideohub" in s or "cdn-iframe" in s
+
+
+def encode_episode_matrix(matrix):
+    def encode(value):
+        if isinstance(value,VideoItem):
+            return {"$video_item":asdict(value)}
+        if isinstance(value,list):
+            return [encode(item) for item in value]
+        if isinstance(value,dict):
+            return {str(key):encode(item) for key,item in value.items()}
+        return value
+    return {str(episode):encode(items) for episode,items in matrix.items()}
+
+
+def decode_episode_matrix(data):
+    def decode(value):
+        if isinstance(value,dict) and "$video_item" in value:
+            return VideoItem(**value["$video_item"])
+        if isinstance(value,list):
+            return [decode(item) for item in value]
+        if isinstance(value,dict):
+            return {key:decode(item) for key,item in value.items()}
+        return value
+    return {float(episode):decode(items) for episode,items in data.items()}
+
+
+class DownloadCheckpoint:
+    """Atomic task journal; completed files are reused only if unchanged."""
+    def __init__(self,payload,path=CHECKPOINT_FILE):
+        self.path=Path(path)
+        self.payload=payload
+        self.lock=threading.Lock()
+
+    @classmethod
+    def load(cls,path=CHECKPOINT_FILE):
+        path=Path(path)
+        if not path.is_file():
+            return None
+        payload=json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("schema") != 1 or not isinstance(payload.get("settings"),dict):
+            raise ValueError("Неподдерживаемое состояние загрузки.")
+        return cls(payload,path)
+
+    def save(self):
+        with self.lock:
+            self.path.parent.mkdir(parents=True,exist_ok=True)
+            temporary=self.path.with_name(self.path.name+".tmp")
+            temporary.write_text(json.dumps(self.payload,ensure_ascii=False,indent=2),encoding="utf-8")
+            temporary.replace(self.path)
+
+    def file(self,key):
+        record=self.payload.get("files",{}).get(key)
+        if not record:
+            return None
+        path=Path(record["path"])
+        try:
+            stat=path.stat()
+            if stat.st_size == record["size"] and stat.st_mtime_ns == record["mtime_ns"]:
+                return path, VideoItem(**record["item"])
+        except (OSError,KeyError,TypeError,ValueError):
+            pass
+        return None
+
+    def mark_file(self,key,path,item):
+        path=Path(path)
+        stat=path.stat()
+        self.payload.setdefault("files",{})[key]={"path":str(path),"size":stat.st_size,
+                                                   "mtime_ns":stat.st_mtime_ns,"item":asdict(item)}
+        self.save()
+
+    def complete_episode(self,episode,path):
+        path=Path(path)
+        stat=path.stat()
+        self.payload.setdefault("episodes",{})[str(episode)]={"path":str(path),
+            "size":stat.st_size,"mtime_ns":stat.st_mtime_ns}
+        self.save()
+
+    def episode_complete(self,episode):
+        record=self.payload.get("episodes",{}).get(str(episode))
+        if not record:
+            return False
+        try:
+            stat=Path(record["path"]).stat()
+            return stat.st_size == record["size"] and stat.st_mtime_ns == record["mtime_ns"]
+        except (OSError,KeyError,TypeError,ValueError):
+            return False
+
+    def clear(self):
+        self.path.unlink(missing_ok=True)
+
+    def discard(self):
+        """Remove staging files for this task after Stop."""
+        try:
+            settings=self.payload.get("settings",{})
+            base=Path(settings.get("base_dir","")).resolve()
+            title=base/safe_name(settings.get("anime_title", ""))
+            if title.resolve().parent == base and title.is_dir():
+                staging=title/".tmp"
+                if staging.resolve().parent == title.resolve() and staging.is_dir():
+                    shutil.rmtree(staging)
+                for folder in (title,title/f"Season {int(settings.get('season_number',1)):02d}"):
+                    if folder.is_dir() and folder.resolve().parent in (title.resolve(),base):
+                        for entry in folder.iterdir():
+                            if entry.name.startswith(safe_name(settings.get("anime_title",""))):
+                                if entry.name.endswith((".part",".part.url",".range.part",".range.part.json")):
+                                    entry.unlink(missing_ok=True)
+                            elif entry.name.startswith(".hls_") and entry.is_dir():
+                                shutil.rmtree(entry)
+        finally:
+            self.clear()
 
 
 @dataclass
@@ -661,7 +774,7 @@ def audio_track_ids(mkvmerge, media_path):
     return [t["id"] for t in info.get("tracks", []) if t.get("type") == "audio"]
 
 
-def merge_audio_tracks(mkvmerge, sources, output_path, progress_cb=None, video_source=None):
+def merge_audio_tracks(mkvmerge, sources, output_path, progress_cb=None, video_source=None, control=None):
     if len(sources) < 2 and video_source is None:
         raise RuntimeError("Для объединения нужно минимум две озвучки.")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -687,17 +800,24 @@ def merge_audio_tracks(mkvmerge, sources, output_path, progress_cb=None, video_s
         cmd += [str(media_file)]
     proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,
         encoding="utf-8",errors="replace",bufsize=1,**hidden_subprocess_kwargs())
+    if control: control.set_process(proc)
     lines=[]; last=-1
-    for line in proc.stdout or []:
-        lines.append(line.rstrip())
-        LOGGER.debug("mkvmerge: %s", line.rstrip())
-        pm=re.search(r"Progress:\s*(\d+)%",line,re.I)
-        if pm:
-            pct=max(0,min(100,int(pm.group(1))))
-            if pct!=last and progress_cb: progress_cb(pct); last=pct
-    code=proc.wait()
-    close=getattr(proc.stdout,"close",None)
-    if close: close()
+    try:
+        for line in proc.stdout or []:
+            if control: control.check()
+            lines.append(line.rstrip())
+            LOGGER.debug("mkvmerge: %s", line.rstrip())
+            pm=re.search(r"Progress:\s*(\d+)%",line,re.I)
+            if pm:
+                pct=max(0,min(100,int(pm.group(1))))
+                if pct!=last and progress_cb: progress_cb(pct); last=pct
+        code=proc.wait()
+        if control: control.check()
+    finally:
+        if proc.poll() is None: proc.kill(); proc.wait()
+        if control: control.clear_process(proc)
+        close=getattr(proc.stdout,"close",None)
+        if close: close()
     if code>=2: raise RuntimeError("\n".join(lines[-20:]) or "Ошибка mkvmerge")
     if progress_cb: progress_cb(100)
     return "\n".join(lines)
@@ -771,10 +891,12 @@ class WorkThread(QThread):
     progress=Signal(int,int,str)
     done=Signal(str,object)
     failed=Signal(str)
+    paused=Signal()
+    stopped=Signal()
     def __init__(self,player,dubbings,episode_items,quality,base_dir,anime_title,merge_enabled,
                  mkvmerge_path,keep_sources,season_number=1,plex_structure=True,
                  plexmatch_enabled=True,anime_metadata=None,resolver_config=None,ffmpeg_path="",
-                 chapters_enabled=True):
+                 chapters_enabled=True,checkpoint=None):
         super().__init__(); self.player=player; self.dubbings=dubbings; self.episode_items=episode_items
         self.quality=quality; self.base_dir=Path(base_dir); self.anime_title=anime_title
         self.merge_enabled=merge_enabled; self.mkvmerge=mkvmerge_path; self.keep_sources=keep_sources
@@ -783,7 +905,10 @@ class WorkThread(QThread):
         self.resolver_config=resolver_config or {}; self.ffmpeg=ffmpeg_path or find_ffmpeg()
         self.chapters_enabled=chapters_enabled
         self.resolver=PlayerResolver(self.resolver_config)
+        self.checkpoint=checkpoint
+        self.control=DownloadControl()
     def emit_progress(self,ep_index,total_eps,series_pct,status):
+        self.control.check()
         series_pct=max(0,min(100,int(series_pct)))
         overall=int((((ep_index-1)+series_pct/100.0)/max(1,total_eps))*100)
         self.progress.emit(series_pct,max(0,min(100,overall)),status)
@@ -841,18 +966,33 @@ class WorkThread(QThread):
         suffix=Path(urllib.parse.urlparse(result.url).path).suffix.lower()
         return suffix if suffix in RESOLVER_MEDIA_EXTS else ".mp4"
     def download_mp4_audio(self,result,path,item,progress_cb, *, require_ranges=False):
-        with tempfile.TemporaryDirectory(prefix=".mp4_audio_",dir=Path(path).parent) as directory:
+        if self.checkpoint:
+            key=hashlib.sha256(str(getattr(item,"iframe_url",result.url)).encode()).hexdigest()[:12]
+            directory=Path(path).parent/f".mp4_audio_{safe_name(Path(path).stem)}_{key}"
+            directory.mkdir(parents=True,exist_ok=True)
+        else:
+            directory=Path(tempfile.mkdtemp(prefix=".mp4_audio_",dir=Path(path).parent))
+        finished=False
+        try:
             video=Path(directory)/"source.mp4"
             headers={"User-Agent":CHROME_UA}; headers.update(result.headers or {})
-            download_ranges(result.url,video,headers,
-                            lambda pct,detail:progress_cb(int(pct*0.9),detail),
-                            attempts=2 if require_ranges else 4,require_ranges=require_ranges)
+            if not video.is_file():
+                download_ranges(result.url,video,headers,
+                                lambda pct,detail:progress_cb(int(pct*0.9),detail),
+                                attempts=2 if require_ranges else 4,require_ranges=require_ranges,
+                                control=self.control,resume=bool(self.checkpoint))
+            self.control.check()
             local=StreamResult(str(video),"local_file",{},{})
             local.audio_only=True
             self.download_stream(local,path,item,
                                  lambda pct,detail:progress_cb(90+int(pct/10),"Извлечение аудио · "+detail))
+            finished=True
+        finally:
+            if (finished or not self.checkpoint) and directory.resolve().parent == Path(path).parent.resolve():
+                shutil.rmtree(directory,ignore_errors=True)
 
     def download_stream(self,result,path,item,progress_cb):
+        self.control.check()
         path=Path(path); path.parent.mkdir(parents=True,exist_ok=True)
         if result.source != "local_hls" and (result.source == "alloha" or result.audio_only) and urllib.parse.urlparse(result.url).path.lower().endswith(".m3u8"):
             source_key=hashlib.sha256(str(getattr(item,"iframe_url",result.url)).encode()).hexdigest()[:12]
@@ -874,7 +1014,7 @@ class WorkThread(QThread):
             try:
                 playlist = stage_hls(result.url, cache, headers, progress_cb,
                                      refresh=refresh if result.source == "alloha" else None,
-                                     audio_only=result.audio_only)
+                                     audio_only=result.audio_only,control=self.control)
             except requests.RequestException as error:
                 raise RuntimeError(f"{result.source}: не удалось получить все сегменты серии.") from error
             local = StreamResult(str(playlist), "local_hls", {}, {})
@@ -950,6 +1090,7 @@ class WorkThread(QThread):
                     "-map_metadata", "-1", "-map_chapters", "-1", "-c:a", "copy", str(path)]
             proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,
                 encoding="utf-8",errors="replace",bufsize=1,**hidden_subprocess_kwargs())
+            self.control.set_process(proc)
             errors=[]; last=-1; downloaded_seconds=0.0; missing_segment=False
             for line in proc.stdout or []:
                 line=line.strip(); seconds=None
@@ -976,6 +1117,8 @@ class WorkThread(QThread):
             code=proc.wait()
             close=getattr(proc.stdout,"close",None)
             if close: close()
+            self.control.clear_process(proc)
+            self.control.check()
             if missing_segment:
                 raise RuntimeError("Источник не отдал видеосегмент. Неполная серия не будет сохранена как готовая.")
             network_failure = any(re.search(
@@ -1000,13 +1143,16 @@ class WorkThread(QThread):
         headers={"User-Agent":CHROME_UA}; headers.update(result.headers or {})
         if result.source in ("cvh","sibnet"):
             try:
-                download_ranges(result.url, path, headers, progress_cb)
+                download_ranges(result.url, path, headers, progress_cb,
+                                control=self.control,resume=bool(self.checkpoint))
             except RangeDownloadError:
                 LOGGER.warning("Parallel video transport interrupted; retrying ranges sequentially: provider=%s",result.source)
                 progress_cb(0,"Источник прервал параллельную загрузку — повторяю последовательно…")
-                download_ranges(result.url,path,headers,progress_cb,workers=1)
+                download_ranges(result.url,path,headers,progress_cb,workers=1,
+                                control=self.control,resume=bool(self.checkpoint))
         else:
-            download_file(result.url, path, headers, progress_cb)
+            download_file(result.url, path, headers, progress_cb,
+                          control=self.control,resume=bool(self.checkpoint))
     def run(self):
         try:
             LOGGER.info("Download started: title=%s episodes=%s dubbings=%s quality=%s chapters=%s",
@@ -1026,6 +1172,11 @@ class WorkThread(QThread):
             download_dubs = (["__video__"] if use_merge else []) + self.dubbings
             dub_span=download_part/max(1,len(download_dubs))
             for ep_index,ep in enumerate(episodes,1):
+                self.control.check()
+                if self.checkpoint and self.checkpoint.episode_complete(ep):
+                    completed+=1
+                    self.emit_progress(ep_index,total_eps,100,f"Серия {episode_label(ep)}: уже скачана.")
+                    continue
                 LOGGER.info("Episode %s started",ep)
                 source_files=[]; ep_label=episode_label(ep); temp_dir=title_dir/".tmp"/f"episode_{safe_name(ep_label)}"; failed=False
                 self.emit_progress(ep_index,total_eps,0,f"Серия {ep_label} ({ep_index}/{len(episodes)}): подготовка…")
@@ -1033,6 +1184,14 @@ class WorkThread(QThread):
                     item=self.episode_items[ep].get(dub); dub_start=(dub_index-1)*dub_span
                     self.emit_progress(ep_index,total_eps,dub_start,f"Серия {ep_label} ({ep_index}/{len(episodes)}): {dub} — получение прямой ссылки…")
                     if not item: errors.append(f"Серия {ep_label}: нет озвучки «{dub}»."); failed=True; break
+                    cached=self.checkpoint.file(f"{ep}:{dub}") if self.checkpoint else None
+                    if cached:
+                        cached_path,item=cached
+                        if dub == "__video__": self.episode_items[ep]["__video__"]=item
+                        source_files.append((cached_path,dub))
+                        self.emit_progress(ep_index,total_eps,dub_start+dub_span,
+                                           f"Серия {ep_label}: {dub} — уже скачано")
+                        continue
                     video_item = self.episode_items[ep].get("__video__")
                     if use_merge and dub != "__video__" and video_item and dub == video_item.dubbing:
                         LOGGER.info("Audio reused from downloaded video: episode=%s dubbing=%s provider=%s",
@@ -1066,9 +1225,10 @@ class WorkThread(QThread):
                                     f"{dub} · {provider_label(item)} — обновляю источник "
                                     f"(попытка {attempt}/{max_attempts})…",
                                 )
-                                time.sleep(0.8 * (attempt - 1))
+                                self.control.wait(0.8 * (attempt - 1))
 
                             stream = self.resolve_stream(item, audio_only=use_merge and dub != "__video__")
+                            self.control.check()
                             LOGGER.info("Resolved episode=%s dubbing=%s provider=%s quality=%s URL=%s",
                                         ep,dub,stream.source,stream.quality,safe_url(stream.url))
                             ext = self.extension_for(stream)
@@ -1109,10 +1269,13 @@ class WorkThread(QThread):
                                 except Exception as chapter_error:
                                     LOGGER.exception("Chapter processing failed for episode=%s dubbing=%s",ep,dub)
                                     errors.append(f"Серия {ep_label}, {dub}: главы не добавлены: {chapter_error}")
+                            if self.checkpoint: self.checkpoint.mark_file(f"{ep}:{dub}",dest,item)
                             source_files.append((dest, dub))
                             last_error = None
                             break
 
+                        except (PauseDownload,StopDownload):
+                            raise
                         except Exception as e:
                             last_error = e
                             LOGGER.exception("Download attempt failed: episode=%s dubbing=%s attempt=%s/%s",
@@ -1137,24 +1300,38 @@ class WorkThread(QThread):
                     try:
                         def mp(pct): self.emit_progress(ep_index,total_eps,90+pct*0.10,f"Серия {ep_label} ({ep_index}/{len(episodes)}): MKVToolNix — {pct}%")
                         merge_audio_tracks(self.mkvmerge,source_files[1:],output,progress_cb=mp,
-                                           video_source=source_files[0][0]); completed+=1
+                                           video_source=source_files[0][0],control=self.control); completed+=1
                         try:
                             first_item=self.episode_items[ep].get("__video__") or self.episode_items[ep].get(self.dubbings[0])
                             self.ensure_chapters(output,first_item,ep,chapter_source=source_files[0][0])
                         except Exception as chapter_error:
                             LOGGER.exception("Chapter processing failed for merged episode=%s",ep)
                             errors.append(f"Серия {ep_label}: главы не добавлены: {chapter_error}")
+                        self.control.check()
+                        if self.checkpoint: self.checkpoint.complete_episode(ep,output)
                         if not self.keep_sources: shutil.rmtree(temp_dir,ignore_errors=True)
+                    except (PauseDownload,StopDownload):
+                        raise
                     except Exception as e:
                         LOGGER.exception("MKV merge failed for episode=%s",ep)
                         errors.append(f"Серия {ep_label}: MKVToolNix: {e}")
-                else: completed+=1
+                else:
+                    completed+=1
+                    if self.checkpoint and source_files:
+                        self.checkpoint.complete_episode(ep,source_files[0][0])
                 self.emit_progress(ep_index,total_eps,100,f"Серия {ep_label} ({ep_index}/{len(episodes)}): готово.")
             if use_merge and not self.keep_sources:
                 try: (title_dir/".tmp").rmdir()
                 except Exception: pass
             self.progress.emit(100,100,"Готово")
+            if self.checkpoint and not errors: self.checkpoint.clear()
             self.done.emit(f"Готово. Обработано серий: {completed}. Ошибок/пропусков: {len(errors)}.",errors)
+        except PauseDownload:
+            LOGGER.info("Download paused: %s",self.anime_title)
+            self.paused.emit()
+        except StopDownload:
+            LOGGER.info("Download stopped: %s",self.anime_title)
+            self.stopped.emit()
         except Exception as e:
             LOGGER.exception("Download worker failed")
             self.failed.emit(str(e))
@@ -1316,6 +1493,12 @@ class MainWindow(QMainWindow):
         self.dub_checks = {}
         self.fetch_thread = None
         self.work_thread = None
+        self.close_after_pause = False
+        try:
+            self.checkpoint = DownloadCheckpoint.load(CONFIG_DIR / "pending-download.json")
+        except (OSError,ValueError,KeyError,TypeError) as error:
+            LOGGER.warning("Cannot read pending download: %s", error)
+            self.checkpoint = None
         self.quality_threads = []
         self.quality_probe_serial = 0
         self.quality_probe_timer = QTimer(self)
@@ -1439,10 +1622,16 @@ class MainWindow(QMainWindow):
         )
         self.folder_btn = QPushButton("Папка…")
         self.download_btn = QPushButton("Скачать")
+        self.pause_btn = QPushButton("Пауза")
+        self.resume_btn = QPushButton("Продолжить")
+        self.stop_btn = QPushButton("Остановить")
         out.addWidget(QLabel("Куда:"))
         out.addWidget(self.folder_edit, 1)
         out.addWidget(self.folder_btn)
         out.addWidget(self.download_btn)
+        out.addWidget(self.pause_btn)
+        out.addWidget(self.resume_btn)
+        out.addWidget(self.stop_btn)
         layout.addLayout(out)
 
         self.current_status_label = QLabel("Готово")
@@ -1470,6 +1659,14 @@ class MainWindow(QMainWindow):
         self.ep_none.clicked.connect(lambda: self.set_episode_checks(Qt.Unchecked))
         self.folder_btn.clicked.connect(self.choose_folder)
         self.download_btn.clicked.connect(self.start_download)
+        self.pause_btn.clicked.connect(self.pause_download)
+        self.resume_btn.clicked.connect(self.resume_download)
+        self.stop_btn.clicked.connect(self.stop_download)
+        self.set_download_buttons()
+        if self.checkpoint:
+            settings=self.checkpoint.payload["settings"]
+            self.current_status_label.setText(
+                f"Есть незавершённая загрузка: {settings.get('anime_title','аниме')}. Нажмите «Продолжить».")
 
         self.update_mkv_status()
         update_error = self.previous_update_error()
@@ -1837,6 +2034,9 @@ class MainWindow(QMainWindow):
         return anime_display_title(self.anime)
 
     def start_download(self):
+        if self.checkpoint:
+            self.current_status_label.setText("Сначала продолжите или остановите незавершённую загрузку.")
+            return
         player = self.player_combo.currentText()
         dubbings = self.selected_dubbings()
         episodes = self.selected_episodes()
@@ -1875,15 +2075,14 @@ class MainWindow(QMainWindow):
         quality_value=self.quality_combo.currentData()
         if not quality_value:
             QMessageBox.information(self,APP_NAME,"Дождитесь определения доступных качеств или выберите доступное качество."); return
-        self.download_btn.setEnabled(False); self.series_progress.setValue(0); self.overall_progress.setValue(0)
+        self.series_progress.setValue(0); self.overall_progress.setValue(0)
         self.current_status_label.setText("Подготовка загрузки…")
         LOGGER.info("Selection: player=%s dubbings=%s episodes=%s quality=%s merge=%s",
                     player,dubbings,episodes,quality_value,do_merge)
 
-        self.work_thread = WorkThread(
+        settings=dict(
             player=player,
             dubbings=dubbings,
-            episode_items=selected_matrix,
             quality=quality_value,
             base_dir=self.folder_edit.text(),
             anime_title=self.anime_title(),
@@ -1894,14 +2093,97 @@ class MainWindow(QMainWindow):
             plex_structure=self.plex_structure.isChecked(),
             plexmatch_enabled=self.plexmatch_check.isChecked(),
             anime_metadata=self.anime,
-            resolver_config=self.config,
             ffmpeg_path=self.config.get("ffmpeg_path", "") or find_ffmpeg(),
             chapters_enabled=self.chapters_check.isChecked(),
         )
+        payload={"schema":1,"settings":settings,"matrix":encode_episode_matrix(selected_matrix),
+                 "url":self.url_edit.currentText(),"files":{},"episodes":{}}
+        self.checkpoint=DownloadCheckpoint(payload,CONFIG_DIR / "pending-download.json")
+        try:
+            self.checkpoint.save()
+        except OSError as error:
+            self.checkpoint=None
+            QMessageBox.critical(self,APP_NAME,f"Не удалось сохранить состояние загрузки: {error}")
+            return
+        self.launch_download(selected_matrix)
+
+    def launch_download(self, matrix):
+        settings=dict(self.checkpoint.payload["settings"])
+        settings["episode_items"]=matrix
+        settings["resolver_config"]=self.config
+        settings["ffmpeg_path"]=self.config.get("ffmpeg_path") or find_ffmpeg()
+        self.work_thread=WorkThread(**settings,checkpoint=self.checkpoint)
         self.work_thread.progress.connect(self.on_progress)
         self.work_thread.done.connect(self.on_done)
         self.work_thread.failed.connect(self.on_work_failed)
+        self.work_thread.paused.connect(self.on_paused)
+        self.work_thread.stopped.connect(self.on_stopped)
+        self.work_thread.finished.connect(self.on_worker_finished)
         self.work_thread.start()
+        self.set_download_buttons()
+
+    def set_download_buttons(self):
+        active=self.work_thread is not None and self.work_thread.isRunning()
+        pending=self.checkpoint is not None
+        self.download_btn.setEnabled(not active and not pending)
+        self.pause_btn.setEnabled(active)
+        self.resume_btn.setEnabled(pending and not active)
+        self.stop_btn.setEnabled(pending)
+
+    def pause_download(self):
+        if self.work_thread and self.work_thread.isRunning():
+            self.work_thread.control.request("paused")
+            self.pause_btn.setEnabled(False)
+            self.current_status_label.setText("Приостанавливаю загрузку…")
+
+    def resume_download(self):
+        if not self.checkpoint or (self.work_thread and self.work_thread.isRunning()): return
+        try:
+            matrix=decode_episode_matrix(self.checkpoint.payload["matrix"])
+        except (KeyError,ValueError,TypeError) as error:
+            QMessageBox.critical(self,APP_NAME,f"Не удалось восстановить загрузку: {error}")
+            return
+        settings=self.checkpoint.payload["settings"]
+        self.url_edit.setCurrentText(self.checkpoint.payload.get("url",""))
+        self.title_label.setText(settings["anime_title"])
+        self.folder_edit.setText(settings["base_dir"])
+        self.current_status_label.setText("Возобновляю загрузку…")
+        self.launch_download(matrix)
+
+    def stop_download(self):
+        if self.work_thread and self.work_thread.isRunning():
+            self.work_thread.control.request("stopped")
+            self.pause_btn.setEnabled(False)
+            self.stop_btn.setEnabled(False)
+            self.current_status_label.setText("Останавливаю загрузку…")
+        else:
+            self.on_stopped()
+
+    def on_paused(self):
+        self.current_status_label.setText("Загрузка приостановлена. Её можно продолжить после запуска приложения.")
+
+    def on_stopped(self):
+        if self.checkpoint:
+            try: self.checkpoint.discard()
+            except (OSError,ValueError,TypeError) as error:
+                LOGGER.warning("Cannot remove stopped download staging: %s",error)
+        self.checkpoint=None
+        self.set_download_buttons()
+        self.current_status_label.setText("Загрузка остановлена.")
+
+    def on_worker_finished(self):
+        self.work_thread=None
+        self.set_download_buttons()
+        if self.close_after_pause:
+            QTimer.singleShot(0,self.close)
+
+    def closeEvent(self,event):
+        if self.work_thread and self.work_thread.isRunning():
+            self.close_after_pause=True
+            self.pause_download()
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def on_progress(self, series_value, overall_value, text):
         self.series_progress.setValue(series_value); self.overall_progress.setValue(overall_value)
@@ -1909,7 +2191,9 @@ class MainWindow(QMainWindow):
 
     def on_done(self, summary, errors):
         LOGGER.info("Download finished: %s errors=%s",summary,len(errors))
-        self.download_btn.setEnabled(True); self.series_progress.setValue(100); self.overall_progress.setValue(100)
+        if not errors: self.checkpoint=None
+        self.set_download_buttons()
+        self.series_progress.setValue(100); self.overall_progress.setValue(100)
         self.current_status_label.setText(summary)
         detail = ""
         if errors:
@@ -1920,7 +2204,8 @@ class MainWindow(QMainWindow):
 
     def on_work_failed(self, error):
         LOGGER.error("Download failed: %s",error)
-        self.download_btn.setEnabled(True); self.current_status_label.setText(f"Ошибка: {error}")
+        self.set_download_buttons()
+        self.current_status_label.setText(f"Ошибка: {error}")
         QMessageBox.critical(self, APP_NAME, error)
 
 

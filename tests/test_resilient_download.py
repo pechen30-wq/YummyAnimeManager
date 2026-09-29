@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 import requests
 
-from resilient_download import download_file, download_ranges
+from resilient_download import download_file, download_ranges, DownloadControl, PauseDownload
 
 
 class Response:
@@ -112,6 +112,24 @@ class DownloadTests(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), b"abcdef")
         self.assertNotIn("Range", get.call_args_list[2].kwargs["headers"])
 
+    def test_pause_keeps_partial_file_for_next_process(self):
+        control=DownloadControl()
+        def pause_at_first_chunk(*_):
+            control.request("paused")
+        with patch("resilient_download.requests.get", return_value=Response(
+                200,{"Content-Length":"6"},[b"abc",b"def"])):
+            with self.assertRaises(PauseDownload):
+                download_file("https://example.test/video",self.path,{},pause_at_first_chunk,
+                              control=control,resume=True)
+        self.assertEqual(self.path.with_name(self.path.name+".part").read_bytes(),b"abc")
+        self.assertFalse(self.path.exists())
+        with patch("resilient_download.requests.get",return_value=Response(
+                206,{"Content-Range":"bytes 3-5/6"},[b"def"])) as get:
+            download_file("https://example.test/video",self.path,{},lambda *_:None,
+                          control=DownloadControl(),resume=True)
+        self.assertEqual(get.call_args.kwargs["headers"]["Range"],"bytes=3-")
+        self.assertEqual(self.path.read_bytes(),b"abcdef")
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -158,6 +176,48 @@ class RangeDownloadTests(unittest.TestCase):
 
 
 class ParallelRangeTests(unittest.TestCase):
+    def test_pause_reuses_verified_blocks_after_restart(self):
+        block_size=65536
+        data=b''.join(bytes([index])*block_size for index in range(12))
+        requested=[]
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version='HTTP/1.1'
+            def log_message(self,*_): pass
+            def do_GET(self):
+                start,end=map(int,self.headers['Range'].removeprefix('bytes=').split('-'))
+                end=min(end,len(data)-1)
+                requested.append(start)
+                self.send_response(206)
+                self.send_header('Content-Range',f'bytes {start}-{end}/{len(data)}')
+                self.send_header('Content-Length',str(end-start+1))
+                self.send_header('ETag','"v1"')
+                self.end_headers()
+                try: self.wfile.write(data[start:end+1]);self.wfile.flush()
+                except (BrokenPipeError,ConnectionResetError): pass
+        server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler)
+        threading.Thread(target=server.serve_forever,daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                path=Path(directory)/'video.mp4'
+                control=DownloadControl()
+                def pause(pct,_):
+                    if pct>=40: control.request('paused')
+                url=f'http://127.0.0.1:{server.server_port}/video.mp4'
+                with self.assertRaises(PauseDownload):
+                    download_ranges(url,path,{},pause,block_size=block_size,
+                                    control=control,resume=True)
+                self.assertFalse(path.exists())
+                ledger=path.with_name('video.mp4.range.part.json')
+                self.assertTrue(ledger.is_file())
+                before=len(requested)
+                download_ranges(url+'?renewed=1',path,{},lambda *_:None,
+                                block_size=block_size,control=DownloadControl(),resume=True)
+                self.assertEqual(path.read_bytes(),data)
+                self.assertLess(len(requested)-before,12)
+                self.assertFalse(ledger.exists())
+        finally:
+            server.shutdown();server.server_close()
+
     def check_server(self, mode):
         data=b''.join(bytes([index])*65536 for index in range(24))
         state={'active':0,'peak':0,'ports':set(),'retried':0}

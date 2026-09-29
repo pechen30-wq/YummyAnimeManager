@@ -102,8 +102,9 @@ def layout(body):
             for line in body.splitlines() if line.strip() and not line.startswith("#EXT-X-PROGRAM-DATE-TIME")]
 
 
-def stage_hls(url, cache, headers, progress, refresh=None, audio_only=False, workers=4):
+def stage_hls(url, cache, headers, progress, refresh=None, audio_only=False, workers=4, control=None):
     """Reuse only fully downloaded assets; .part files are never fed to FFmpeg."""
+    if control: control.check()
     started = time.monotonic()
     cache = Path(cache)
     cache.mkdir(parents=True, exist_ok=True)
@@ -157,6 +158,7 @@ def stage_hls(url, cache, headers, progress, refresh=None, audio_only=False, wor
 
     def report(target, pct, detail):
         nonlocal last_report, last_pct
+        if control: control.check()
         with state_lock:
             if stopped.is_set():
                 return
@@ -171,12 +173,14 @@ def stage_hls(url, cache, headers, progress, refresh=None, audio_only=False, wor
 
     def download(target):
         nonlocal refreshes
+        if control: control.check()
         if not hasattr(thread_state, "session"):
             thread_state.session = requests.Session()
             with state_lock:
                 sessions.append(thread_state.session)
         session = thread_state.session
         for attempt in range(19):
+            if control: control.check()
             if stopped.is_set():
                 return
             with refresh_lock:
@@ -186,7 +190,7 @@ def stage_hls(url, cache, headers, progress, refresh=None, audio_only=False, wor
                 download_file(request_url, cache / names[target], request_headers,
                               lambda pct, detail: report(target, pct, detail),
                               session=session, attempts=2, cancelled=stopped.is_set,
-                              sleep=stopped.wait)
+                              sleep=stopped.wait, control=control)
                 report(target, 100, "Готово")
                 return
             except requests.HTTPError as error:
@@ -227,13 +231,17 @@ def stage_hls(url, cache, headers, progress, refresh=None, audio_only=False, wor
     try:
         # Bound both active work and queued work, so a failed CDN stops promptly.
         for _ in range(max(1, min(4, workers))):
+            if control: control.check()
             target = next(pending, None)
             if target is not None:
                 active.add(pool.submit(download, target))
         while active:
-            done, active = wait(active, return_when=FIRST_COMPLETED)
+            if control: control.check()
+            done, active = wait(active, timeout=0.25 if control else None,
+                                return_when=FIRST_COMPLETED)
             for future in done:
                 future.result()
+            if control: control.check()
             for _ in done:
                 target = next(pending, None)
                 if target is not None:
@@ -245,6 +253,7 @@ def stage_hls(url, cache, headers, progress, refresh=None, audio_only=False, wor
             session.close()
 
     # FFmpeg sees the ordered manifest only after every resource is complete.
+    if control: control.check()
     playlist.write_text("\n".join(output) + "\n", encoding="utf-8")
     elapsed = time.monotonic() - started
     size = sum((cache / name).stat().st_size for name in names.values())
