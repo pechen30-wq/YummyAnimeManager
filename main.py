@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "YummyAnime Manager"
-APP_VERSION = "4.5.3"
+APP_VERSION = "4.5.4"
 YUMMY_API_BASE = "https://api.yani.tv"
 CVH_API_BASE = "https://plapi.cdnvideohub.com/api/v1/player/sv"
 
@@ -610,10 +610,22 @@ def _parse_iso_duration(value):
 
 def estimate_manifest_duration(result):
     """Best-effort duration for HLS/DASH when YummyAnime duration is absent."""
+    if not result.is_manifest:
+        return 0.0
+    def read_manifest(url):
+        # Metadata probing must never buffer an accidentally returned media file.
+        with requests.get(url, headers=headers, timeout=(5, 10), stream=True) as response:
+            response.raise_for_status()
+            chunks=[]; size=0
+            for chunk in response.iter_content(65536):
+                size += len(chunk)
+                if size > 2 * 1024 * 1024:
+                    raise ValueError("Manifest exceeds metadata probe limit")
+                chunks.append(chunk)
+            return b"".join(chunks).decode("utf-8-sig")
     try:
         headers={"User-Agent":CHROME_UA}; headers.update(result.headers or {})
-        r=requests.get(result.url,headers=headers,timeout=20); r.raise_for_status()
-        body=r.text; low=urllib.parse.urlparse(result.url).path.lower()
+        body=read_manifest(result.url); low=urllib.parse.urlparse(result.url).path.lower()
         if low.endswith(".m3u8"):
             vals=re.findall(r"#EXTINF:([0-9.]+)",body,re.I)
             if vals: return sum(float(x) for x in vals)
@@ -625,8 +637,7 @@ def estimate_manifest_duration(result):
                 if pending and line and not line.startswith("#"):
                     variants.append(urllib.parse.urljoin(result.url,line)); pending=False
             if variants:
-                rr=requests.get(variants[-1],headers=headers,timeout=20); rr.raise_for_status()
-                vals=re.findall(r"#EXTINF:([0-9.]+)",rr.text,re.I)
+                vals=re.findall(r"#EXTINF:([0-9.]+)",read_manifest(variants[-1]),re.I)
                 if vals: return sum(float(x) for x in vals)
         if low.endswith(".mpd"):
             m=re.search(r"mediaPresentationDuration=[\"']([^\"']+)[\"']",body,re.I)
@@ -849,6 +860,7 @@ class WorkThread(QThread):
                 shutil.rmtree(cache)
             return
         if result.is_manifest or result.audio_only:
+            progress_cb(0, "Аудио — открываю поток…" if result.audio_only else "Открываю видеопоток…")
             if not self.ffmpeg or not Path(self.ffmpeg).exists():
                 raise RuntimeError("Для HLS/DASH нужен FFmpeg. Откройте Настройки и укажите ffmpeg.exe.")
             headers=dict(result.headers or {})
@@ -917,10 +929,13 @@ class WorkThread(QThread):
                         hh,mm,ss=line.split("=",1)[1].split(":"); seconds=int(hh)*3600+int(mm)*60+float(ss)
                     except Exception: pass
                 elif line and "=" not in line: errors.append(line)
-                if seconds is not None and duration>0:
+                if seconds is not None:
                     downloaded_seconds=max(downloaded_seconds,seconds)
-                    pct=max(0,min(99,int(seconds*100/duration)))
-                    if pct!=last: progress_cb(pct,f"{pct}%"); last=pct
+                    if duration>0:
+                        pct=max(0,min(99,int(seconds*100/duration)))
+                        if pct!=last: progress_cb(pct,f"{pct}%"); last=pct
+                    elif seconds>=0:
+                        progress_cb(0, f"Получено {'аудио' if result.audio_only else 'видео'}: {int(seconds)//60}:{int(seconds)%60:02d}")
             code=proc.wait()
             if missing_segment:
                 raise RuntimeError("Источник не отдал видеосегмент. Неполная серия не будет сохранена как готовая.")

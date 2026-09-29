@@ -38,8 +38,10 @@ class HlsDownloadTests(unittest.TestCase):
                                 False, '', False, ffmpeg_path=ffmpeg)
             stream = StreamResult(f'http://127.0.0.1:{server.server_port}/video.mp4',
                                   'sibnet', {}, {}, audio_only=True)
-            worker.download_stream(stream, root/'audio.mka', SimpleNamespace(duration=2),
-                                   lambda *_: None)
+            with patch('main.requests.get') as metadata_request:
+                worker.download_stream(stream, root/'audio.mka', SimpleNamespace(duration=None),
+                                       lambda *_: None)
+                metadata_request.assert_not_called()
             probe = subprocess.run([ffmpeg, '-hide_banner', '-i', str(root/'audio.mka')],
                                    capture_output=True, text=True, timeout=10)
             self.assertIn('Audio:', probe.stderr)
