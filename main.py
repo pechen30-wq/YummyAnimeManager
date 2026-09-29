@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "YummyAnime Manager"
-APP_VERSION = "4.5.7"
+APP_VERSION = "4.5.8"
 YUMMY_API_BASE = "https://api.yani.tv"
 CVH_API_BASE = "https://plapi.cdnvideohub.com/api/v1/player/sv"
 
@@ -983,7 +983,10 @@ class WorkThread(QThread):
                 raise RuntimeError(f"Видео скачано не полностью: {downloaded_seconds:.1f} из {duration:.1f} секунд.")
             progress_cb(100,"100%"); return
         headers={"User-Agent":CHROME_UA}; headers.update(result.headers or {})
-        download_file(result.url, path, headers, progress_cb)
+        if result.source == "cvh":
+            download_ranges(result.url, path, headers, progress_cb)
+        else:
+            download_file(result.url, path, headers, progress_cb)
     def run(self):
         try:
             LOGGER.info("Download started: title=%s episodes=%s dubbings=%s quality=%s chapters=%s",
@@ -1012,6 +1015,10 @@ class WorkThread(QThread):
                     if not item: errors.append(f"Серия {ep_label}: нет озвучки «{dub}»."); failed=True; break
                     video_item = self.episode_items[ep].get("__video__")
                     if use_merge and dub != "__video__" and video_item and dub == video_item.dubbing:
+                        LOGGER.info("Audio reused from downloaded video: episode=%s dubbing=%s provider=%s",
+                                    ep,dub,provider_kind(video_item))
+                        self.emit_progress(ep_index,total_eps,dub_start+dub_span,
+                                           f"Серия {ep_label}: {dub} — звук из скачанного видео")
                         source_files.append((source_files[0][0],dub))
                         continue
                     if dub == "__video__" or not use_merge:
@@ -1518,7 +1525,7 @@ class MainWindow(QMainWindow):
     def all_items_for_current_season(self):
         return [v for v in self.videos if v.season_hint is None or v.season_hint == self.current_season()]
     def on_player_changed(self):
-        self.update_source_status(); self.rebuild_episodes()
+        self.update_source_status(); self.refresh_dubbing_sources(); self.rebuild_episodes()
     def on_season_changed(self): self.rebuild_dubbings()
     def schedule_quality_probe(self):
         self.quality_probe_serial += 1
@@ -1690,16 +1697,35 @@ class MainWindow(QMainWindow):
 
         for i, dub in enumerate(dubbings):
             item = QListWidgetItem(dub)
+            item.setData(Qt.UserRole, dub)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Checked if i == 0 else Qt.Unchecked)
             self.dub_list.addItem(item)
 
         self.dub_list.blockSignals(False)
+        self.refresh_dubbing_sources()
         self.rebuild_episodes()
+
+    def refresh_dubbing_sources(self):
+        items = self.all_items_for_current_season()
+        player = self.player_combo.currentText()
+        self.dub_list.blockSignals(True)
+        try:
+            for index in range(self.dub_list.count()):
+                row = self.dub_list.item(index)
+                dub = row.data(Qt.UserRole)
+                sources = sorted({provider_label(v) for v in items if v.dubbing == dub},key=str.casefold)
+                row.setText(f"{dub}\nПлееры: {', '.join(sources)}")
+                available = any(v.dubbing == dub and v.player == player for v in items)
+                row.setToolTip("Источники: " + ", ".join(sources) +
+                               (". Доступна в выбранном плеере; если выбрана для видео, её звук используется без повторной загрузки."
+                                if available else ". Аудио будет получено из другого плеера."))
+        finally:
+            self.dub_list.blockSignals(False)
 
     def selected_dubbings(self):
         return [
-            self.dub_list.item(i).text()
+            self.dub_list.item(i).data(Qt.UserRole)
             for i in range(self.dub_list.count())
             if self.dub_list.item(i).checkState() == Qt.Checked
         ]
@@ -1718,10 +1744,14 @@ class MainWindow(QMainWindow):
             # Video is independent of which audio studios were selected.
             matrix[v.episode_key].setdefault("__video_candidates__", []).append(v)
             matrix[v.episode_key].setdefault("__video__", v)
-            if selected and v.dubbing == selected[0]:
-                matrix[v.episode_key]["__video__"] = v
-                matrix[v.episode_key][selected[0]] = v
         for dubs in matrix.values():
+            # Prefer any selected voice available in the chosen video player,
+            # even when the first checked voice exists only in another player.
+            candidates = dubs.get("__video_candidates__", [])
+            if not candidates:
+                continue
+            rank = {dub:index for index,dub in enumerate(selected)}
+            dubs["__video__"] = min(candidates,key=lambda v:rank.get(v.dubbing,len(selected)))
             video = dubs.get("__video__")
             if video:
                 candidates=dubs["__video_candidates__"]

@@ -41,6 +41,69 @@ class SourceTests(unittest.TestCase):
             self.assertEqual(len(window.selected_dubbings()), 3)
             self.assertEqual(window.episode_matrix()[1.0]["__video__"].player, "Kodik")
 
+    def test_video_reuses_later_selected_voice_and_labels_keep_voice_identity(self):
+        with patch('main.load_config',return_value={'public_token':'test'}), \
+             patch.object(MainWindow,'schedule_quality_probe'):
+            window=MainWindow(); self.addCleanup(window.close)
+            raw=[{'data':{'player':player,'dubbing':dub},'number':str(ep),'index':ep,
+                  'iframe_url':'','video_id':index} for index,(player,dub,ep) in enumerate([
+                      ('CVH','Unused voice',1),('CVH','B selected voice',1),
+                      ('Sibnet','A selected voice',1),('Kodik','B selected voice',1),
+                      ('Sibnet','A selected voice',2)])]
+            window.on_loaded({'title':'Test'},raw)
+            for index in range(window.dub_list.count()):
+                row=window.dub_list.item(index)
+                row.setCheckState(Qt.Checked if row.data(Qt.UserRole) in
+                                  ('A selected voice','B selected voice') else Qt.Unchecked)
+            self.assertEqual(window.selected_dubbings(),['A selected voice','B selected voice'])
+            matrix=window.episode_matrix()
+            self.assertEqual(matrix[1.0]['__video__'].dubbing,'B selected voice')
+            self.assertEqual(matrix[1.0]['B selected voice'],matrix[1.0]['__video__'])
+            self.assertNotIn(2.0,matrix)
+            b=next(window.dub_list.item(i) for i in range(window.dub_list.count())
+                   if window.dub_list.item(i).data(Qt.UserRole)=='B selected voice')
+            self.assertIn('CVH',b.text());self.assertIn('Kodik',b.text())
+            window.player_combo.setCurrentText('Kodik')
+            self.assertEqual(window.selected_dubbings(),['A selected voice','B selected voice'])
+
+    def test_matching_video_audio_is_not_resolved_or_downloaded_again(self):
+        from main import WorkThread,VideoItem
+        from resolvers import StreamResult
+        video=VideoItem(1,'CVH','B voice','1',1,'')
+        audio=VideoItem(2,'Sibnet','A voice','1',1,'')
+        seen=[]
+        def resolve(item,audio_only=False):
+            seen.append((item.dubbing,audio_only))
+            return StreamResult('https://example.com/media.mp4','direct',{}, {},audio_only=audio_only)
+        def download(stream,path,item,progress):
+            path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(b'media')
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);mkv=root/'mkvmerge.exe';mkv.touch()
+            worker=WorkThread('CVH',['A voice','B voice'],
+                {1.0:{'__video__':video,'B voice':video,'A voice':audio}},'1080p',root,
+                'Test',True,str(mkv),False,plexmatch_enabled=False,chapters_enabled=False)
+            results=[];worker.done.connect(lambda summary,errors:results.append(errors))
+            with patch.object(worker,'resolve_stream',side_effect=resolve), \
+                 patch.object(worker,'download_stream',side_effect=download), \
+                 patch('main.PlayerResolver.release'),patch('main.merge_audio_tracks') as merge:
+                worker.run()
+                inputs=merge.call_args.args[1]
+                self.assertEqual(inputs[1][0],merge.call_args.kwargs['video_source'])
+            self.assertEqual(seen,[('B voice',False),('A voice',True)])
+            self.assertEqual(results,[[]])
+
+    def test_direct_cvh_video_uses_verified_ranges(self):
+        from main import WorkThread,VideoItem
+        from resolvers import StreamResult
+        worker=WorkThread('CVH',['Voice'],{},'1080p','.', 'Test',False,'',False)
+        item=VideoItem(1,'CVH','Voice','1',1,'')
+        stream=StreamResult('https://example.com/video.mp4','cvh',{}, {'Referer':'https://example.com/'})
+        with tempfile.TemporaryDirectory() as directory, \
+             patch('main.download_ranges') as ranged,patch('main.download_file') as regular:
+            worker.download_stream(stream,Path(directory)/'video.mp4',item,lambda *_:None)
+            ranged.assert_called_once();regular.assert_not_called()
+            self.assertEqual(ranged.call_args.args[2]['Referer'],'https://example.com/')
+
     def test_audio_quality_does_not_constrain_video_quality(self):
         from main import WorkThread, VideoItem
         from resolvers import StreamResult

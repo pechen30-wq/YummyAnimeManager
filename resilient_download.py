@@ -117,6 +117,7 @@ def download_file(url, path, headers, progress_cb, *, attempts=4, sleep=time.sle
 def download_ranges(url, path, headers, progress, *, block_size=1024 * 1024,
                     attempts=4, sleep=time.sleep):
     """Commit only complete, contiguous, size-validated HTTP ranges."""
+    started = time.monotonic()
     path = Path(path)
     part = path.with_name(path.name + ".range.part")
     part.unlink(missing_ok=True)
@@ -197,5 +198,6 @@ def download_ranges(url, path, headers, progress, *, block_size=1024 * 1024,
     if not total or offset != total or part.stat().st_size != total:
         raise RuntimeError("MP4 скачан не полностью.")
     part.replace(path)
-    LOGGER.info("MP4 range download complete: %s bytes=%s", path, total)
+    LOGGER.info("MP4 range download complete: %s bytes=%s elapsed=%.2fs",
+                path, total, time.monotonic()-started)
     progress(100, "MP4 полностью скачан")
