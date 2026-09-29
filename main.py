@@ -2172,6 +2172,7 @@ class MainWindow(QMainWindow):
         self.current_status_label.setText("Загрузка остановлена.")
 
     def on_worker_finished(self):
+        if self.work_thread: self.work_thread.wait()
         self.work_thread=None
         self.set_download_buttons()
         if self.close_after_pause:
