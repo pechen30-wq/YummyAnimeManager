@@ -24,7 +24,7 @@ from url_history import remember_url
 
 from resolvers import (
     PlayerResolver, StreamResult, choose_stream, find_ffmpeg, provider_kind,
-    provider_label, system_proxy_for, CHROME_UA,
+    provider_label, system_proxy_for, CHROME_UA, SourceUnavailableError,
     DIRECT_MEDIA_EXTS as RESOLVER_MEDIA_EXTS,
 )
 from PySide6.QtCore import Qt, QThread, Signal, QUrl, QTimer
@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "YummyAnime Manager"
-APP_VERSION = "4.5.4"
+APP_VERSION = "4.5.5"
 YUMMY_API_BASE = "https://api.yani.tv"
 CVH_API_BASE = "https://plapi.cdnvideohub.com/api/v1/player/sv"
 
@@ -696,6 +696,8 @@ def merge_audio_tracks(mkvmerge, sources, output_path, progress_cb=None, video_s
             pct=max(0,min(100,int(pm.group(1))))
             if pct!=last and progress_cb: progress_cb(pct); last=pct
     code=proc.wait()
+    close=getattr(proc.stdout,"close",None)
+    if close: close()
     if code>=2: raise RuntimeError("\n".join(lines[-20:]) or "Ошибка mkvmerge")
     if progress_cb: progress_cb(100)
     return "\n".join(lines)
@@ -727,7 +729,7 @@ class QualityProbeThread(QThread):
     def __init__(self, serial, config, items):
         super().__init__(); self.serial=serial; self.config=dict(config or {}); self.items=list(items or [])
     def run(self):
-        resolver=PlayerResolver(self.config); sets=[]; notes=[]; successes=0
+        resolver=PlayerResolver(self.config); sets=[]; notes=[]; successes=0; unavailable=False
         for item in self.items:
             stream=None
             try:
@@ -737,6 +739,7 @@ class QualityProbeThread(QThread):
                 labels={str(x) for x in labels if x}
                 if labels: sets.append(labels); successes+=1
             except Exception as e:
+                unavailable = unavailable or isinstance(e, SourceUnavailableError)
                 LOGGER.exception("Quality probe failed for dubbing=%s", getattr(item, 'dubbing', ''))
                 notes.append(f"{getattr(item,'dubbing','')}: {e}")
             finally:
@@ -751,6 +754,8 @@ class QualityProbeThread(QThread):
             note=f"Проверено по первой общей серии для {successes} озвуч." + (f" Ошибки: {'; '.join(notes[:2])}" if notes else "")
         else:
             qualities=[]; note="Не удалось автоматически определить качества. "+("; ".join(notes[:2]) if notes else "")
+            if unavailable:
+                note="Источник недоступен: плеер отдаёт ссылки на отсутствующие файлы. Выберите другой плеер для видео; озвучки можно оставить выбранными."
         self.done.emit(self.serial,qualities,note)
 
 
@@ -937,6 +942,8 @@ class WorkThread(QThread):
                     elif seconds>=0:
                         progress_cb(0, f"Получено {'аудио' if result.audio_only else 'видео'}: {int(seconds)//60}:{int(seconds)%60:02d}")
             code=proc.wait()
+            close=getattr(proc.stdout,"close",None)
+            if close: close()
             if missing_segment:
                 raise RuntimeError("Источник не отдал видеосегмент. Неполная серия не будет сохранена как готовая.")
             if code!=0: raise RuntimeError("\n".join(errors[-12:]) or "FFmpeg завершился с ошибкой.")
@@ -971,13 +978,19 @@ class WorkThread(QThread):
                     item=self.episode_items[ep].get(dub); dub_start=(dub_index-1)*dub_span
                     self.emit_progress(ep_index,total_eps,dub_start,f"Серия {ep_label} ({ep_index}/{len(episodes)}): {dub} — получение прямой ссылки…")
                     if not item: errors.append(f"Серия {ep_label}: нет озвучки «{dub}»."); failed=True; break
-                    if use_merge and dub != "__video__" and item == self.episode_items[ep].get("__video__"):
+                    video_item = self.episode_items[ep].get("__video__")
+                    if use_merge and dub != "__video__" and video_item and dub == video_item.dubbing:
                         source_files.append((source_files[0][0],dub))
                         continue
-                    candidates = ([item] if dub == "__video__" else
-                                  self.episode_items[ep].get("__audio_candidates__", {}).get(dub, [item]))
+                    if dub == "__video__" or not use_merge:
+                        candidates = self.episode_items[ep].get("__video_candidates__", [item])
+                        if not use_merge:
+                            candidates = [v for v in candidates if v.dubbing == dub] or [item]
+                    else:
+                        candidates = self.episode_items[ep].get("__audio_candidates__", {}).get(dub, [item])
                     attempt_items = [candidate for candidate in candidates
-                                     for _ in range(3 if provider_kind(candidate) in ("aksor", "alloha") else 2)]
+                                     for _ in range(3 if provider_kind(candidate) == "alloha" else
+                                                    1 if provider_kind(candidate) == "aksor" else 2)]
                     max_attempts = len(attempt_items)
                     last_error = None
 
@@ -1031,6 +1044,8 @@ class WorkThread(QThread):
                                 )
 
                             self.download_stream(stream, dest, item, fp)
+                            if dub == "__video__":
+                                self.episode_items[ep]["__video__"] = item
                             if not use_merge:
                                 try:
                                     dest=self.ensure_chapters(dest,item,ep)
@@ -1246,6 +1261,10 @@ class MainWindow(QMainWindow):
         self.work_thread = None
         self.quality_threads = []
         self.quality_probe_serial = 0
+        self.quality_probe_timer = QTimer(self)
+        self.quality_probe_timer.setSingleShot(True)
+        self.quality_probe_timer.setInterval(250)
+        self.quality_probe_timer.timeout.connect(self.start_quality_probe)
         self.update_check_thread = None
         self.update_download_thread = None
 
@@ -1472,8 +1491,14 @@ class MainWindow(QMainWindow):
         self.update_source_status(); self.rebuild_episodes()
     def on_season_changed(self): self.rebuild_dubbings()
     def schedule_quality_probe(self):
+        self.quality_probe_serial += 1
+        self.quality_probe_timer.start()
+    def start_quality_probe(self):
+        if self.quality_threads:
+            self.quality_probe_timer.start()
+            return
         selected=self.selected_dubbings(); matrix=self.episode_matrix(); common=[ep for ep,dubs in matrix.items() if all(d in dubs for d in selected)]
-        self.quality_probe_serial+=1; serial=self.quality_probe_serial
+        serial=self.quality_probe_serial
         self.quality_combo.clear(); self.quality_combo.addItem("Проверяю…",None); self.quality_combo.setEnabled(False)
         self.quality_status.setText("Проверяю реальные качества выбранного источника…")
         if not selected or not common:
@@ -1492,7 +1517,8 @@ class MainWindow(QMainWindow):
         if qualities:
             shown=", ".join("Авто" if x=="auto" else x for x in qualities); self.quality_status.setText(f"Реально найдено: {shown}. {note}")
         else:
-            self.quality_status.setText("Фиксированные разрешения определить заранее не удалось. «Лучшее доступное» будет определено при скачивании. "+note)
+            self.quality_status.setText(note if note.startswith("Источник недоступен:") else
+                "Фиксированные разрешения определить заранее не удалось. «Лучшее доступное» будет определено при скачивании. "+note)
 
     def update_source_status(self):
         player = self.player_combo.currentText()
@@ -1660,12 +1686,16 @@ class MainWindow(QMainWindow):
                 matrix[v.episode_key].setdefault("__audio_candidates__", {}).setdefault(v.dubbing, []).append(v)
         for v in self.player_items_for_current_season():
             # Video is independent of which audio studios were selected.
+            matrix[v.episode_key].setdefault("__video_candidates__", []).append(v)
             matrix[v.episode_key].setdefault("__video__", v)
             if selected and v.dubbing == selected[0]:
                 matrix[v.episode_key]["__video__"] = v
                 matrix[v.episode_key][selected[0]] = v
         for dubs in matrix.values():
             video = dubs.get("__video__")
+            if video:
+                candidates=dubs["__video_candidates__"]
+                dubs["__video_candidates__"] = [video] + [v for v in candidates if v != video]
             if video and video.dubbing in selected:
                 dubs[video.dubbing] = video
                 candidates = dubs["__audio_candidates__"][video.dubbing]

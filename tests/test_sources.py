@@ -51,6 +51,51 @@ class SourceTests(unittest.TestCase):
             audio = worker.resolve_stream(item, audio_only=True)
         self.assertEqual(audio.url, "audio-url")
 
+    def test_video_fallback_keeps_player_and_does_not_relabel_its_audio(self):
+        from main import WorkThread, VideoItem
+        from resolvers import StreamResult
+        bad = VideoItem(1, 'CVH', 'Selected voice', '1', 1, '')
+        good_video = VideoItem(2, 'CVH', 'Other voice', '1', 1, '')
+        audio = VideoItem(3, 'Kodik', 'Selected voice', '1', 1, '')
+        seen = []
+        def resolve(item, audio_only=False):
+            seen.append((item.video_id, audio_only))
+            if item == bad:
+                raise RuntimeError('Unavailable file')
+            return StreamResult('https://example.com/media.mp4', 'direct', {}, {}, audio_only=audio_only)
+        def download(stream, path, item, progress):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b'media')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); mkv=root/'mkvmerge.exe'; mkv.touch()
+            matrix = {1.0: {'__video__': bad, '__video_candidates__': [bad, good_video],
+                           'Selected voice': audio, '__audio_candidates__': {'Selected voice': [audio]}}}
+            worker=WorkThread('CVH',['Selected voice'],matrix,'1080p',root,'Test',True,str(mkv),False,
+                              plexmatch_enabled=False,chapters_enabled=False)
+            with patch.object(worker,'resolve_stream',side_effect=resolve), \
+                 patch.object(worker,'download_stream',side_effect=download), \
+                 patch('main.PlayerResolver.release'), patch('main.merge_audio_tracks') as merge, \
+                 patch('main.time.sleep'):
+                worker.run()
+            self.assertEqual(seen, [(1,False),(1,False),(2,False),(3,True)])
+            self.assertEqual(matrix[1.0]['__video__'], good_video)
+            self.assertEqual(merge.call_args.args[1][0][1], 'Selected voice')
+            self.assertTrue(str(merge.call_args.args[1][0][0]).endswith('.mka'))
+
+    def test_single_voice_failure_does_not_switch_video_to_audio_provider(self):
+        from main import WorkThread, VideoItem
+        video=VideoItem(1,'CVH','Voice','1',1,'')
+        alternate=VideoItem(2,'Kodik','Voice','1',1,'')
+        with tempfile.TemporaryDirectory() as directory:
+            matrix={1.0: {'__video__':video,'Voice':video,
+                          '__audio_candidates__':{'Voice':[video,alternate]}}}
+            worker=WorkThread('CVH',['Voice'],matrix,'1080p',directory,'Test',False,'',False,
+                              plexmatch_enabled=False,chapters_enabled=False)
+            with patch.object(worker,'resolve_stream',side_effect=RuntimeError('failure')) as resolve, \
+                 patch('main.time.sleep'):
+                worker.run()
+            self.assertTrue(all(call.args[0].player=='CVH' for call in resolve.call_args_list))
+
     def test_mux_separates_video_and_audio_inputs(self):
         process = MagicMock()
         process.stdout = []

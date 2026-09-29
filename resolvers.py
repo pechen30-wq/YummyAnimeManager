@@ -51,6 +51,10 @@ class StreamResult:
         return path.endswith(".m3u8") or path.endswith(".mpd")
 
 
+class SourceUnavailableError(RuntimeError):
+    """The provider's own advertised files do not exist."""
+
+
 def normalize_http_url(url):
     url = str(url or "").strip()
     if not url:
@@ -150,12 +154,23 @@ def find_ffmpeg():
 
 
 def _request(session, method, url, **kwargs):
-    kwargs.setdefault("timeout", 30)
-    LOGGER.debug("Resolver HTTP %s %s",method,safe_url(url))
-    r = session.request(method, url, **kwargs)
-    LOGGER.debug("Resolver HTTP status=%s final=%s",r.status_code,safe_url(r.url))
-    r.raise_for_status()
-    return r
+    kwargs.setdefault("timeout", (5, 15))
+    for attempt in range(3):
+        LOGGER.debug("Resolver HTTP %s %s attempt=%s/3",method,safe_url(url),attempt+1)
+        try:
+            r = session.request(method, url, **kwargs)
+            LOGGER.debug("Resolver HTTP status=%s final=%s",r.status_code,safe_url(r.url))
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                r.close()
+            else:
+                r.raise_for_status()
+                return r
+        except (requests.ConnectionError, requests.Timeout) as error:
+            if attempt == 2:
+                raise
+            LOGGER.warning("Resolver connection interrupted: %s attempt=%s/3",safe_url(url),attempt+1)
+            session.close()  # Reopen stale connection pools, retaining cookies.
+        time.sleep(0.6 * (attempt + 1))
 
 
 def system_proxy_for(url="https://example.com/"):
@@ -409,7 +424,10 @@ class PlayerResolver:
 
     def resolve_kodik(self, item):
         full_url = normalize_http_url(item.iframe_url)
-        headers = {"User-Agent": CHROME_UA, "Referer": "https://yani.tv/", "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8"}
+        # Fetch the standalone iframe without inventing an embedding referrer.
+        # Kodik signs its domain/referrer parameters from this request; a made-up
+        # embed domain can produce HTTP 500 when those signatures reach /ftor.
+        headers = {"User-Agent": CHROME_UA, "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8"}
         page = _request(self.session, "GET", full_url, headers=headers).text.replace("\n", "").replace("\r", "")
 
         def first(pattern):
@@ -458,6 +476,7 @@ class PlayerResolver:
             headers={
                 "User-Agent": CHROME_UA,
                 "Referer": full_url,
+                "Origin": iframe_origin,
                 "X-Requested-With": "XMLHttpRequest",
                 "Content-Type": "application/x-www-form-urlencoded",
             },
@@ -552,6 +571,15 @@ class PlayerResolver:
             "Referer": full_url,
         }
 
+        probe_cache = {}
+        def probe(session, url, headers=None, timeout=10):
+            if url in probe_cache:
+                return probe_cache[url]
+            result = _stream_probe(session, url, headers=headers, timeout=timeout)
+            if result[2] in ("HTTP 404", "HTTP 410"):
+                probe_cache[url] = result
+            return result
+
         raw_candidates = {}
         probe_errors = []
 
@@ -571,7 +599,7 @@ class PlayerResolver:
 
                 reachable = {}
                 for label, url in candidate_map.items():
-                    ok, final_url, err = _stream_probe(
+                    ok, final_url, err = probe(
                         self.session,
                         url,
                         headers=stream_headers,
@@ -614,7 +642,8 @@ class PlayerResolver:
             meta_url = _extract_meta_video_url(page)
             if meta_url and "{{" not in meta_url:
                 meta_url = normalize_http_url(meta_url.replace(" ", "%20"))
-                ok, final_url, err = _stream_probe(
+                raw_candidates["auto"] = meta_url
+                ok, final_url, err = probe(
                     self.session,
                     meta_url,
                     headers=stream_headers,
@@ -674,9 +703,10 @@ class PlayerResolver:
                     ).json()
 
                     alt_map = _aksor_quality_map(payload)
+                    raw_candidates.update(alt_map)
                     reachable = {}
                     for label, url in alt_map.items():
-                        ok, final_url, err = _stream_probe(
+                        ok, final_url, err = probe(
                             self.session,
                             url,
                             headers=stream_headers,
@@ -707,7 +737,9 @@ class PlayerResolver:
         hosts_text = ", ".join(x for x in hosts if x) or "Aksor CDN"
         detail = "; ".join(probe_errors[-4:])
 
-        raise RuntimeError(
+        error_type = (SourceUnavailableError if raw_candidates and
+                      all(url in probe_cache for url in raw_candidates.values()) else RuntimeError)
+        raise error_type(
             "Aksor: CDN для этой серии сейчас недоступен "
             f"({hosts_text}). Приложение трижды обновило ссылку и проверило "
             "fallback плеера, но рабочего потока нет."
@@ -893,13 +925,18 @@ class PlayerResolver:
         base = str(self.config.get("alloha_resolver_url") or "").strip().rstrip("/")
         if not base:
             raise RuntimeError("Alloha требует YummyAnime resolver server. Укажите адрес в Настройках.")
-        ensure_resolver(base)
-        try:
-            r = requests.get(base + "/resolve", params={"url": item.iframe_url}, timeout=45)
-            r.raise_for_status()
-            payload = r.json()
-        except Exception as e:
-            raise RuntimeError(f"Alloha resolver недоступен ({base}): {e}")
+        for attempt in range(3):
+            ensure_resolver(base)
+            try:
+                r = requests.get(base + "/resolve", params={"url": item.iframe_url}, timeout=(5, 45))
+                r.raise_for_status()
+                payload = r.json()
+                break
+            except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as e:
+                if (attempt == 2 or (isinstance(e, requests.HTTPError) and
+                                     e.response is not None and e.response.status_code < 500)):
+                    raise RuntimeError(f"Alloha resolver недоступен ({base}): {e}") from e
+                time.sleep(0.6 * (attempt + 1))
         if payload.get("error"):
             raise RuntimeError(f"Alloha resolver: {payload['error']}")
         url = str(payload.get("url") or "").strip()

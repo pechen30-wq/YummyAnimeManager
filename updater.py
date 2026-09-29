@@ -66,10 +66,20 @@ def validate_asset(asset, name):
 
 
 def fetch_manifest(get=requests.get):
-    response = get(MANIFEST_URL, params={"t": int(time.time())},
-                   headers={"Cache-Control": "no-cache", "User-Agent": "YummyAnimeManager-Updater"},
-                   timeout=(5, 12))
-    response.raise_for_status()
+    for attempt in range(3):
+        try:
+            response = get(MANIFEST_URL, params={"t": int(time.time())},
+                           headers={"Cache-Control": "no-cache", "User-Agent": "YummyAnimeManager-Updater"},
+                           timeout=(5, 12))
+            if response.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                response.close()
+            else:
+                response.raise_for_status()
+                break
+        except (requests.ConnectionError, requests.Timeout):
+            if attempt == 2:
+                raise
+        time.sleep(0.6 * (attempt + 1))
     manifest = response.json()
     if not isinstance(manifest, dict):
         raise ValueError("Неверный формат update.json.")

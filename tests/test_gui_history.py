@@ -28,6 +28,25 @@ class HistoryGuiTests(unittest.TestCase):
             self.assertEqual(window.url_edit.itemText(1), "https://example.com/old")
             save.assert_called()
 
+    def test_quality_checks_are_debounced_and_never_overlap(self):
+        with patch('main.load_config', return_value={'public_token':'test'}), \
+             patch('main.QualityProbeThread') as thread:
+            window=MainWindow()
+            self.addCleanup(window.close)
+            self.addCleanup(window.quality_probe_timer.stop)
+            raw=[{'data':{'player':'CVH','dubbing':'Voice'},'number':'1','index':1,'iframe_url':''}]
+            window.on_loaded({'title':'Test'},raw)
+            for _ in range(5): window.schedule_quality_probe()
+            self.assertEqual(thread.call_count,0)
+            window.quality_probe_timer.timeout.emit()
+            self.assertEqual(thread.call_count,1)
+            for _ in range(5): window.schedule_quality_probe()
+            window.quality_probe_timer.timeout.emit()
+            self.assertEqual(thread.call_count,1)
+            thread.return_value.finished.connect.call_args.args[0]()
+            window.quality_probe_timer.timeout.emit()
+            self.assertEqual(thread.call_count,2)
+
     def test_cvh_is_initial_player_when_available(self):
         with patch("main.load_config", return_value={"public_token": "test"}):
             window = MainWindow()
