@@ -18,7 +18,8 @@ RETRYABLE = (
 CONTENT_RANGE = re.compile(r"bytes (\d+)-(\d+)/(\d+|\*)$", re.I)
 
 
-def download_file(url, path, headers, progress_cb, *, attempts=4, sleep=time.sleep):
+def download_file(url, path, headers, progress_cb, *, attempts=4, sleep=time.sleep,
+                  session=None, cancelled=None):
     """Download into a sidecar, resuming only when the server proves the offset."""
     path = Path(path)
     part = path.with_name(path.name + ".part")
@@ -27,13 +28,16 @@ def download_file(url, path, headers, progress_cb, *, attempts=4, sleep=time.sle
     last_pct = -1
 
     for attempt in range(1, attempts + 1):
+        if cancelled and cancelled():
+            raise RuntimeError("Загрузка фрагмента отменена.")
         offset = part.stat().st_size if part.exists() else 0
         request_headers = dict(headers)
         if offset:
             request_headers["Range"] = f"bytes={offset}-"
         LOGGER.debug("Download request %s attempt=%s/%s offset=%s", safe_url(url), attempt, attempts, offset)
         try:
-            with requests.get(url, headers=request_headers, stream=True,
+            get = session.get if session is not None else requests.get
+            with get(url, headers=request_headers, stream=True,
                               timeout=(15, 60), allow_redirects=True) as response:
                 if offset and response.status_code == 416:
                     part.unlink(missing_ok=True)
@@ -68,6 +72,8 @@ def download_file(url, path, headers, progress_cb, *, attempts=4, sleep=time.sle
                 with part.open("ab" if append else "wb") as output:
                     downloaded = offset
                     for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if cancelled and cancelled():
+                            raise RuntimeError("Загрузка фрагмента отменена.")
                         if not chunk:
                             continue
                         output.write(chunk)
@@ -92,6 +98,8 @@ def download_file(url, path, headers, progress_cb, *, attempts=4, sleep=time.sle
             progress_cb(100, "100%")
             return
         except RETRYABLE as error:
+            if session is not None:
+                session.close()  # Discard a broken pool before reconnecting.
             last_error = error
             LOGGER.warning("Download interrupted attempt=%s/%s: %s: %s",
                            attempt, attempts, type(error).__name__, error)

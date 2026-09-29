@@ -77,7 +77,7 @@ class SourceTests(unittest.TestCase):
                  patch('main.PlayerResolver.release'), patch('main.merge_audio_tracks') as merge, \
                  patch('main.time.sleep'):
                 worker.run()
-            self.assertEqual(seen, [(1,False),(1,False),(2,False),(3,True)])
+            self.assertEqual(seen, [(1,False),(2,False),(3,True)])
             self.assertEqual(matrix[1.0]['__video__'], good_video)
             self.assertEqual(merge.call_args.args[1][0][1], 'Selected voice')
             self.assertTrue(str(merge.call_args.args[1][0][0]).endswith('.mka'))
@@ -140,7 +140,7 @@ class SourceTests(unittest.TestCase):
                  patch.object(worker, "download_stream", side_effect=download), \
                  patch("main.PlayerResolver.release"), patch("main.merge_audio_tracks"):
                 worker.run()
-            self.assertEqual(seen, ["Alloha", "Kodik", "Kodik", "CVH"])
+            self.assertEqual(seen, ["Alloha", "Kodik", "CVH"])
             self.assertEqual(results[0][1], [])
             self.assertIn("Обработано серий: 1", results[0][0])
 

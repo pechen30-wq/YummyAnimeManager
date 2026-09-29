@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "YummyAnime Manager"
-APP_VERSION = "4.5.5"
+APP_VERSION = "4.5.6"
 YUMMY_API_BASE = "https://api.yani.tv"
 CVH_API_BASE = "https://plapi.cdnvideohub.com/api/v1/player/sv"
 
@@ -759,6 +759,14 @@ class QualityProbeThread(QThread):
         self.done.emit(self.serial,qualities,note)
 
 
+def source_attempt_order(candidates):
+    """Try other sources of the same voice before repeating a failing CDN."""
+    limits = [3 if provider_kind(item) == "alloha" else
+              1 if provider_kind(item) == "aksor" else 2 for item in candidates]
+    return [item for round_index in range(max(limits, default=0))
+            for item, limit in zip(candidates, limits) if round_index < limit]
+
+
 class WorkThread(QThread):
     progress=Signal(int,int,str)
     done=Signal(str,object)
@@ -988,9 +996,7 @@ class WorkThread(QThread):
                             candidates = [v for v in candidates if v.dubbing == dub] or [item]
                     else:
                         candidates = self.episode_items[ep].get("__audio_candidates__", {}).get(dub, [item])
-                    attempt_items = [candidate for candidate in candidates
-                                     for _ in range(3 if provider_kind(candidate) == "alloha" else
-                                                    1 if provider_kind(candidate) == "aksor" else 2)]
+                    attempt_items = source_attempt_order(candidates)
                     max_attempts = len(attempt_items)
                     last_error = None
 

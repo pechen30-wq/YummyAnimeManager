@@ -1,7 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import requests
 
@@ -74,6 +74,27 @@ class DownloadTests(unittest.TestCase):
                 Response(200, {"Content-Length": "6"}, [b"abc", ConnectionResetError()]),
                 Response(206, {"Content-Range": "bytes 2-5/6"}, [b"cdef"]),
             ])
+        self.assertFalse(self.path.exists())
+
+    def test_session_reconnect_preserves_validated_range_resume(self):
+        session = Mock()
+        session.get.side_effect = [
+            Response(200, {"Content-Length": "6"}, [b"abc", ConnectionResetError("reset")]),
+            Response(206, {"Content-Range": "bytes 3-5/6"}, [b"def"]),
+        ]
+        download_file("https://example.test/video", self.path, {}, lambda *_: None,
+                      session=session, sleep=lambda _: None)
+        self.assertEqual(self.path.read_bytes(), b"abcdef")
+        session.close.assert_called_once()
+        self.assertEqual(session.get.call_args.kwargs["headers"]["Range"], "bytes=3-")
+
+    def test_cancelled_download_never_publishes_partial_file(self):
+        cancelled = Mock(side_effect=[False, False, True])
+        session = Mock()
+        session.get.return_value = Response(200, {"Content-Length": "6"}, [b"abc", b"def"])
+        with self.assertRaisesRegex(RuntimeError, "отменена"):
+            download_file("https://example.test/video", self.path, {}, lambda *_: None,
+                          session=session, cancelled=cancelled)
         self.assertFalse(self.path.exists())
 
     def test_rejected_range_restarts_without_range(self):
