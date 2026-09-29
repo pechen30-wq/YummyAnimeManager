@@ -136,6 +136,12 @@ class HlsDownloadTests(unittest.TestCase):
 
 class Mp4FallbackTests(unittest.TestCase):
     def test_interrupted_remote_audio_is_downloaded_in_ranges_and_remuxed_locally(self):
+        self.check_audio_transport(preferred=False)
+
+    def test_sibnet_uses_range_transport_before_opening_remote_audio(self):
+        self.check_audio_transport(preferred=True)
+
+    def check_audio_transport(self,preferred):
         ffmpeg=find_ffmpeg()
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory)
@@ -167,8 +173,8 @@ class Mp4FallbackTests(unittest.TestCase):
             self.addCleanup(server.shutdown)
             url=f'http://127.0.0.1:{server.server_port}/video.mp4'
             worker=WorkThread('CVH',['Voice'],{},'Лучшее',root,'Test',False,'',False,ffmpeg_path=ffmpeg)
-            stream=StreamResult(url,'cvh',{}, {},audio_only=True)
-            fresh=StreamResult(url,'cvh',{}, {},audio_only=True)
+            stream=StreamResult(url,'sibnet' if preferred else 'direct',{}, {},audio_only=True)
+            fresh=StreamResult(url,'direct',{}, {},audio_only=True)
             failed=Mock()
             failed.stdout=iter(['Stream ends prematurely at 786432, should be 431929346\n',
                                 'Error opening input files: End of file\n'])
@@ -177,14 +183,19 @@ class Mp4FallbackTests(unittest.TestCase):
             calls=[]
             def popen(*args,**kwargs):
                 calls.append(args[0])
-                return failed if len(calls)==1 else original(*args,**kwargs)
+                return failed if not preferred and len(calls)==1 else original(*args,**kwargs)
             progress=[]
             with patch('main.subprocess.Popen',side_effect=popen), \
                  patch.object(worker,'resolve_stream',return_value=fresh) as resolve, \
                  patch('main.PlayerResolver.release'):
                 worker.download_stream(stream,root/'audio.mka',SimpleNamespace(duration=2),
                                        lambda pct,_:progress.append(pct))
-                resolve.assert_called_once()
+                if preferred:
+                    resolve.assert_not_called()
+                    self.assertEqual(len(calls),1)
+                    self.assertNotEqual(calls[0][calls[0].index('-i')+1],url)
+                else:
+                    resolve.assert_called_once()
             self.assertTrue(ranges)
             self.assertTrue(all(value and value.split('-')[1] for value in ranges))
             self.assertEqual(progress[-1],100)

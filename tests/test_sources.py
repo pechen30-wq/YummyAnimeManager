@@ -104,6 +104,19 @@ class SourceTests(unittest.TestCase):
             ranged.assert_called_once();regular.assert_not_called()
             self.assertEqual(ranged.call_args.args[2]['Referer'],'https://example.com/')
 
+    def test_direct_video_network_failure_retries_sequentially(self):
+        from main import WorkThread,VideoItem
+        from resolvers import StreamResult
+        from resilient_download import RangeDownloadError
+        worker=WorkThread('CVH',['Voice'],{},'1080p','.', 'Test',False,'',False)
+        item=VideoItem(1,'CVH','Voice','1',1,'')
+        stream=StreamResult('https://example.com/video.mp4','cvh',{}, {})
+        with tempfile.TemporaryDirectory() as directory, \
+             patch('main.download_ranges',side_effect=[RangeDownloadError('timeout'),None]) as ranged:
+            worker.download_stream(stream,Path(directory)/'video.mp4',item,lambda *_:None)
+            self.assertEqual(ranged.call_count,2)
+            self.assertEqual(ranged.call_args.kwargs['workers'],1)
+
     def test_audio_quality_does_not_constrain_video_quality(self):
         from main import WorkThread, VideoItem
         from resolvers import StreamResult

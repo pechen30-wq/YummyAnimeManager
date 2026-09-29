@@ -16,7 +16,7 @@ from collections import defaultdict
 from typing import Any
 
 import requests
-from resilient_download import download_file, download_ranges
+from resilient_download import download_file, download_ranges, RangeUnsupportedError, RangeDownloadError
 from hls_download import stage_hls
 from chapters import aniskip_points, inspect_media, remux_to_mkv
 from diagnostics import LOGGER, LOG_DIR, configure_logging, install_exception_hooks, safe_url
@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "YummyAnime Manager"
-APP_VERSION = "4.5.8"
+APP_VERSION = "4.5.9"
 YUMMY_API_BASE = "https://api.yani.tv"
 CVH_API_BASE = "https://plapi.cdnvideohub.com/api/v1/player/sv"
 
@@ -840,6 +840,18 @@ class WorkThread(QThread):
         if result.is_manifest: return ".mkv"
         suffix=Path(urllib.parse.urlparse(result.url).path).suffix.lower()
         return suffix if suffix in RESOLVER_MEDIA_EXTS else ".mp4"
+    def download_mp4_audio(self,result,path,item,progress_cb, *, require_ranges=False):
+        with tempfile.TemporaryDirectory(prefix=".mp4_audio_",dir=Path(path).parent) as directory:
+            video=Path(directory)/"source.mp4"
+            headers={"User-Agent":CHROME_UA}; headers.update(result.headers or {})
+            download_ranges(result.url,video,headers,
+                            lambda pct,detail:progress_cb(int(pct*0.9),detail),
+                            attempts=2 if require_ranges else 4,require_ranges=require_ranges)
+            local=StreamResult(str(video),"local_file",{},{})
+            local.audio_only=True
+            self.download_stream(local,path,item,
+                                 lambda pct,detail:progress_cb(90+int(pct/10),"Извлечение аудио · "+detail))
+
     def download_stream(self,result,path,item,progress_cb):
         path=Path(path); path.parent.mkdir(parents=True,exist_ok=True)
         if result.source != "local_hls" and (result.source == "alloha" or result.audio_only) and urllib.parse.urlparse(result.url).path.lower().endswith(".m3u8"):
@@ -872,6 +884,14 @@ class WorkThread(QThread):
             if cache.resolve().parent == path.parent.resolve():
                 shutil.rmtree(cache)
             return
+        if result.audio_only and result.source in ("cvh","sibnet") and not result.is_manifest:
+            progress_cb(0,"Аудио — загружаю MP4 в четыре потока…")
+            try:
+                return self.download_mp4_audio(result,path,item,progress_cb,require_ranges=True)
+            except (RangeUnsupportedError,RangeDownloadError,requests.RequestException) as error:
+                LOGGER.warning("Parallel audio transport unavailable; using FFmpeg: provider=%s reason=%s",
+                               result.source,type(error).__name__)
+                progress_cb(0,"Источник не принял параллельную загрузку — открываю аудиопоток…")
         if result.is_manifest or result.audio_only:
             progress_cb(0, "Аудио — открываю поток…" if result.audio_only else "Открываю видеопоток…")
             if not self.ffmpeg or not Path(self.ffmpeg).exists():
@@ -889,6 +909,9 @@ class WorkThread(QThread):
             proxy = system_proxy_for(result.url)
             if proxy:
                 cmd += ["-http_proxy", proxy]
+
+            if result.audio_only and not result.is_manifest:
+                cmd += ["-multiple_requests","1","-short_seek_size","1048576"]
 
             if urllib.parse.urlparse(result.url).path.lower().endswith(".m3u8"):
                 cmd += ["-seg_max_retry", "3"]
@@ -966,15 +989,7 @@ class WorkThread(QThread):
                 try:
                     if fresh.is_manifest:
                         return self.download_stream(fresh,path,item,progress_cb)
-                    with tempfile.TemporaryDirectory(prefix=".mp4_audio_",dir=path.parent) as directory:
-                        video=Path(directory)/"source.mp4"
-                        headers={"User-Agent":CHROME_UA}; headers.update(fresh.headers or {})
-                        download_ranges(fresh.url,video,headers,
-                                        lambda pct,detail:progress_cb(int(pct*0.9),detail))
-                        local=StreamResult(str(video),"local_file",{},{})
-                        local.audio_only=True
-                        self.download_stream(local,path,item,
-                                             lambda pct,detail:progress_cb(90+int(pct/10),"Извлечение аудио · "+detail))
+                    self.download_mp4_audio(fresh,path,item,progress_cb)
                     return
                 finally:
                     PlayerResolver.release(fresh)
@@ -983,8 +998,13 @@ class WorkThread(QThread):
                 raise RuntimeError(f"Видео скачано не полностью: {downloaded_seconds:.1f} из {duration:.1f} секунд.")
             progress_cb(100,"100%"); return
         headers={"User-Agent":CHROME_UA}; headers.update(result.headers or {})
-        if result.source == "cvh":
-            download_ranges(result.url, path, headers, progress_cb)
+        if result.source in ("cvh","sibnet"):
+            try:
+                download_ranges(result.url, path, headers, progress_cb)
+            except RangeDownloadError:
+                LOGGER.warning("Parallel video transport interrupted; retrying ranges sequentially: provider=%s",result.source)
+                progress_cb(0,"Источник прервал параллельную загрузку — повторяю последовательно…")
+                download_ranges(result.url,path,headers,progress_cb,workers=1)
         else:
             download_file(result.url, path, headers, progress_cb)
     def run(self):

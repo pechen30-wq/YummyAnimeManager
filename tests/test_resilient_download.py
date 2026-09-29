@@ -1,3 +1,6 @@
+import http.server
+import threading
+import time
 import tempfile
 import unittest
 from pathlib import Path
@@ -123,7 +126,7 @@ class RangeDownloadTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch('resilient_download.requests.Session',return_value=session):
             path=Path(directory)/'video.mp4'
             download_ranges('https://example.test/video',path,{},lambda *_:None,
-                            block_size=3,attempts=2,sleep=lambda _:None)
+                            block_size=3,attempts=2,sleep=lambda _:None,workers=1)
             self.assertEqual(path.read_bytes(),b'abcdef')
         return session
 
@@ -152,3 +155,77 @@ class RangeDownloadTests(unittest.TestCase):
     def test_retries_are_bounded_for_missing_block(self):
         with self.assertRaisesRegex(RuntimeError,'после 2 попыток'):
             self.run_download([requests.ConnectionError('reset')]*2)
+
+
+class ParallelRangeTests(unittest.TestCase):
+    def check_server(self, mode):
+        data=b''.join(bytes([index])*65536 for index in range(24))
+        state={'active':0,'peak':0,'ports':set(),'retried':0}
+        lock=threading.Lock()
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version='HTTP/1.1'
+            def log_message(self,*_):pass
+            def handle(self):
+                try:super().handle()
+                except (ConnectionResetError,ConnectionAbortedError):pass
+            def do_GET(self):
+                start,end=map(int,self.headers['Range'].removeprefix('bytes=').split('-'))
+                end=min(end,len(data)-1)
+                with lock:
+                    state['active']+=1;state['peak']=max(state['peak'],state['active'])
+                    state['ports'].add(self.client_address[1])
+                    fail=mode=='reset' and start==5*65536 and state['retried']==0
+                    if fail:state['retried']+=1
+                try:
+                    if start>0:time.sleep(0.08 if start==65536 else 0.01)
+                    self.send_response(206)
+                    left=start-1 if mode=='bad_range' and start>0 else start
+                    size=len(data)+1 if mode=='changed_size' and start>0 else len(data)
+                    self.send_header('Content-Range',f'bytes {left}-{end}/{size}')
+                    self.send_header('Content-Length',str(end-start+1))
+                    self.send_header('ETag','"changed"' if mode=='changed' and start>0 else '"stable"')
+                    self.end_headers()
+                    if fail:
+                        self.wfile.write(data[start:start+(end-start+1)//2]);self.wfile.flush()
+                        self.close_connection=True
+                        return
+                    self.wfile.write(data[start:end+1]);self.wfile.flush()
+                except (BrokenPipeError,ConnectionResetError,OSError):pass
+                finally:
+                    with lock:state['active']-=1
+        server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler)
+        threading.Thread(target=server.serve_forever,daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                path=Path(directory)/'video.mp4';progress=[]
+                if mode in ('bad_range','changed','changed_size'):
+                    with self.assertRaises(RuntimeError):
+                        download_ranges(f'http://127.0.0.1:{server.server_port}/video.mp4',path,{},
+                                        lambda pct,_:progress.append(pct),block_size=65536,sleep=lambda _:None)
+                    self.assertFalse(path.exists());self.assertNotIn(100,progress)
+                else:
+                    download_ranges(f'http://127.0.0.1:{server.server_port}/video.mp4',path,{},
+                                    lambda pct,_:progress.append(pct),block_size=65536,sleep=lambda _:None)
+                    self.assertEqual(path.read_bytes(),data)
+                    self.assertEqual(progress,sorted(progress));self.assertEqual(progress[-1],100)
+                    self.assertGreater(state['peak'],1);self.assertLessEqual(state['peak'],4)
+                    self.assertLessEqual(len(state['ports']),6)
+                    if mode=='reset':self.assertEqual(state['retried'],1)
+        finally:
+            server.shutdown();server.server_close()
+
+    def test_out_of_order_ranges_are_written_at_correct_offsets(self):self.check_server('normal')
+    def test_interrupted_parallel_block_is_retried_without_corruption(self):self.check_server('reset')
+    def test_wrong_offset_never_publishes(self):self.check_server('bad_range')
+    def test_changed_etag_never_publishes(self):self.check_server('changed')
+    def test_changed_size_never_publishes(self):self.check_server('changed_size')
+
+    def test_range_unsupported_does_not_start_full_download_when_required(self):
+        from resilient_download import RangeUnsupportedError
+        session=Mock();session.__enter__=Mock(return_value=session);session.__exit__=Mock(return_value=False)
+        session.get.return_value=Response(200,{'Content-Length':'100'},[])
+        with tempfile.TemporaryDirectory() as directory,patch('resilient_download.requests.Session',return_value=session):
+            with self.assertRaises(RangeUnsupportedError):
+                download_ranges('https://example.test/video',Path(directory)/'video.mp4',{},
+                                lambda *_:None,require_ranges=True)
+            self.assertEqual(session.get.call_count,1)
