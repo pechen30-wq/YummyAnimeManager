@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 
 import requests
 
-from resilient_download import download_file
+from resilient_download import download_file, download_ranges
 
 
 class Response:
@@ -23,6 +23,9 @@ class Response:
     def raise_for_status(self):
         if self.status_code >= 400:
             raise requests.exceptions.HTTPError(str(self.status_code))
+
+    def close(self):
+        pass
 
     def iter_content(self, chunk_size):
         for chunk in self.chunks:
@@ -109,3 +112,43 @@ class DownloadTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RangeDownloadTests(unittest.TestCase):
+    def run_download(self, responses):
+        session = Mock()
+        session.__enter__ = Mock(return_value=session)
+        session.__exit__ = Mock(return_value=False)
+        session.get.side_effect = responses
+        with tempfile.TemporaryDirectory() as directory, patch('resilient_download.requests.Session',return_value=session):
+            path=Path(directory)/'video.mp4'
+            download_ranges('https://example.test/video',path,{},lambda *_:None,
+                            block_size=3,attempts=2,sleep=lambda _:None)
+            self.assertEqual(path.read_bytes(),b'abcdef')
+        return session
+
+    def test_partial_block_is_retried_without_appending_partial_bytes(self):
+        session=self.run_download([
+            Response(206,{'Content-Range':'bytes 0-2/6','ETag':'"v1"'},[b'ab',ConnectionResetError()]),
+            Response(206,{'Content-Range':'bytes 0-2/6','ETag':'"v1"'},[b'abc']),
+            Response(206,{'Content-Range':'bytes 3-5/6','ETag':'"v1"'},[b'def']),
+        ])
+        self.assertEqual([call.kwargs['headers']['Range'] for call in session.get.call_args_list],
+                         ['bytes=0-2','bytes=0-2','bytes=3-5'])
+        self.assertEqual(session.get.call_args.kwargs['headers']['If-Range'],'"v1"')
+
+    def test_changed_size_or_etag_or_wrong_offset_never_publishes(self):
+        for headers in ({'Content-Range':'bytes 3-5/7'},
+                        {'Content-Range':'bytes 3-5/6','ETag':'"v2"'},
+                        {'Content-Range':'bytes 2-4/6'}):
+            with self.subTest(headers=headers), self.assertRaises(RuntimeError):
+                self.run_download([Response(206,{'Content-Range':'bytes 0-2/6','ETag':'"v1"'},[b'abc']),
+                                   Response(206,headers,[b'def'])])
+
+    def test_ignored_range_uses_full_download_at_start(self):
+        self.run_download([Response(200,{'Content-Length':'6'},[]),
+                           Response(200,{'Content-Length':'6'},[b'abcdef'])])
+
+    def test_retries_are_bounded_for_missing_block(self):
+        with self.assertRaisesRegex(RuntimeError,'после 2 попыток'):
+            self.run_download([requests.ConnectionError('reset')]*2)

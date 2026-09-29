@@ -8,7 +8,7 @@ import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 from main import WorkThread, find_ffmpeg
 from resolvers import StreamResult
@@ -132,3 +132,64 @@ class HlsDownloadTests(unittest.TestCase):
                                            capture_output=True, text=True, timeout=10)
                     self.assertIn('Audio:', probe.stderr)
                     self.assertNotIn('Video:', probe.stderr)
+
+
+class Mp4FallbackTests(unittest.TestCase):
+    def test_interrupted_remote_audio_is_downloaded_in_ranges_and_remuxed_locally(self):
+        ffmpeg=find_ffmpeg()
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            source=root/'source.mp4'
+            subprocess.run([ffmpeg,'-y','-loglevel','error','-f','lavfi','-i',
+                'color=c=red:s=160x90:d=2','-f','lavfi','-i','sine=frequency=440:duration=2',
+                '-c:v','libx264','-c:a','aac','-movflags','+faststart',str(source)],
+                check=True,timeout=20)
+            data=source.read_bytes()
+            ranges=[]
+            class Handler(http.server.BaseHTTPRequestHandler):
+                def log_message(self,*_): pass
+                def do_GET(self):
+                    value=self.headers.get('Range')
+                    ranges.append(value)
+                    self.assert_range(value)
+                def assert_range(self,value):
+                    start,end=map(int,value.removeprefix('bytes=').split('-'))
+                    end=min(end,len(data)-1)
+                    block=data[start:end+1]
+                    self.send_response(206)
+                    self.send_header('Content-Range',f'bytes {start}-{end}/{len(data)}')
+                    self.send_header('Content-Length',str(len(block)))
+                    self.end_headers()
+                    self.wfile.write(block)
+            server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler)
+            threading.Thread(target=server.serve_forever,daemon=True).start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            url=f'http://127.0.0.1:{server.server_port}/video.mp4'
+            worker=WorkThread('CVH',['Voice'],{},'Лучшее',root,'Test',False,'',False,ffmpeg_path=ffmpeg)
+            stream=StreamResult(url,'cvh',{}, {},audio_only=True)
+            fresh=StreamResult(url,'cvh',{}, {},audio_only=True)
+            failed=Mock()
+            failed.stdout=iter(['Stream ends prematurely at 786432, should be 431929346\n',
+                                'Error opening input files: End of file\n'])
+            failed.wait.return_value=1
+            original=subprocess.Popen
+            calls=[]
+            def popen(*args,**kwargs):
+                calls.append(args[0])
+                return failed if len(calls)==1 else original(*args,**kwargs)
+            progress=[]
+            with patch('main.subprocess.Popen',side_effect=popen), \
+                 patch.object(worker,'resolve_stream',return_value=fresh) as resolve, \
+                 patch('main.PlayerResolver.release'):
+                worker.download_stream(stream,root/'audio.mka',SimpleNamespace(duration=2),
+                                       lambda pct,_:progress.append(pct))
+                resolve.assert_called_once()
+            self.assertTrue(ranges)
+            self.assertTrue(all(value and value.split('-')[1] for value in ranges))
+            self.assertEqual(progress[-1],100)
+            self.assertFalse(list(root.glob('.mp4_audio_*')))
+            probe=subprocess.run([ffmpeg,'-hide_banner','-i',str(root/'audio.mka')],
+                                 capture_output=True,text=True,timeout=10)
+            self.assertIn('Audio:',probe.stderr)
+            self.assertNotIn('Video:',probe.stderr)

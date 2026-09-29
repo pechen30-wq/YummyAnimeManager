@@ -16,7 +16,7 @@ from collections import defaultdict
 from typing import Any
 
 import requests
-from resilient_download import download_file
+from resilient_download import download_file, download_ranges
 from hls_download import stage_hls
 from chapters import aniskip_points, inspect_media, remux_to_mkv
 from diagnostics import LOGGER, LOG_DIR, configure_logging, install_exception_hooks, safe_url
@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "YummyAnime Manager"
-APP_VERSION = "4.5.6"
+APP_VERSION = "4.5.7"
 YUMMY_API_BASE = "https://api.yani.tv"
 CVH_API_BASE = "https://plapi.cdnvideohub.com/api/v1/player/sv"
 
@@ -913,11 +913,12 @@ class WorkThread(QThread):
             try: duration=float(getattr(item,"duration",0) or 0)
             except Exception: duration=0.0
             if duration<=0: duration=estimate_manifest_duration(result)
-            if result.source == "local_hls":
+            if result.source in ("local_hls", "local_file"):
                 cmd=[self.ffmpeg,"-y","-hide_banner","-loglevel","error","-nostats",
-                     "-progress","pipe:1","-protocol_whitelist","file,crypto,data",
-                     "-allowed_extensions","ALL","-i",result.url,
-                     "-map","0:v?","-map","0:a?","-map","0:s?","-c","copy",str(path)]
+                     "-progress","pipe:1","-protocol_whitelist","file,crypto,data"]
+                if result.source == "local_hls":
+                    cmd += ["-allowed_extensions","ALL"]
+                cmd += ["-i",result.url,"-map","0:v?","-map","0:a?","-map","0:s?","-c","copy",str(path)]
             if result.audio_only:
                 input_position = cmd.index("-i")
                 cmd[input_position:input_position] = ["-discard:v", "all"]
@@ -954,6 +955,29 @@ class WorkThread(QThread):
             if close: close()
             if missing_segment:
                 raise RuntimeError("Источник не отдал видеосегмент. Неполная серия не будет сохранена как готовая.")
+            network_failure = any(re.search(
+                r"Stream ends prematurely|I/O error|End of file|Connection.*failed|Connection.*reset|timed out",
+                error, re.I) for error in errors)
+            short = duration>0 and downloaded_seconds < duration-max(2.0,duration*0.02)
+            if (code!=0 or short) and network_failure and result.audio_only and not result.is_manifest and result.source != "local_file":
+                LOGGER.warning("Direct audio interrupted; switching to validated MP4 ranges: provider=%s",result.source)
+                progress_cb(0,"Аудиопоток оборван — обновляю ссылку для загрузки MP4 блоками…")
+                fresh=self.resolve_stream(item,audio_only=True)
+                try:
+                    if fresh.is_manifest:
+                        return self.download_stream(fresh,path,item,progress_cb)
+                    with tempfile.TemporaryDirectory(prefix=".mp4_audio_",dir=path.parent) as directory:
+                        video=Path(directory)/"source.mp4"
+                        headers={"User-Agent":CHROME_UA}; headers.update(fresh.headers or {})
+                        download_ranges(fresh.url,video,headers,
+                                        lambda pct,detail:progress_cb(int(pct*0.9),detail))
+                        local=StreamResult(str(video),"local_file",{},{})
+                        local.audio_only=True
+                        self.download_stream(local,path,item,
+                                             lambda pct,detail:progress_cb(90+int(pct/10),"Извлечение аудио · "+detail))
+                    return
+                finally:
+                    PlayerResolver.release(fresh)
             if code!=0: raise RuntimeError("\n".join(errors[-12:]) or "FFmpeg завершился с ошибкой.")
             if duration>0 and downloaded_seconds < duration-max(2.0,duration*0.02):
                 raise RuntimeError(f"Видео скачано не полностью: {downloaded_seconds:.1f} из {duration:.1f} секунд.")
