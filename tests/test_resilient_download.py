@@ -43,7 +43,7 @@ class DownloadTests(unittest.TestCase):
         error=requests.HTTPError(response=Mock(status_code=429,headers={"Retry-After":"120"}))
         self.assertEqual(retry_delay(error,1),60)
 
-    def test_host_connection_limit_is_four(self):
+    def test_host_connection_limit_is_six(self):
         control=DownloadControl()
         release=threading.Event()
         entered=[]
@@ -52,23 +52,23 @@ class DownloadTests(unittest.TestCase):
             with control.transfer("https://same.example/file"):
                 with lock: entered.append(1)
                 release.wait(3)
-        threads=[threading.Thread(target=work) for _ in range(6)]
+        threads=[threading.Thread(target=work) for _ in range(8)]
         for thread in threads: thread.start()
         try:
             deadline=time.monotonic()+2
-            while len(entered)<4 and time.monotonic()<deadline: time.sleep(0.01)
-            self.assertEqual(len(entered),4)
-            self.assertEqual(control.transfer_stats()[0],4)
+            while len(entered)<6 and time.monotonic()<deadline: time.sleep(0.01)
+            self.assertEqual(len(entered),6)
+            self.assertEqual(control.transfer_stats()[0],6)
         finally:
             release.set()
             for thread in threads: thread.join(3)
-        self.assertEqual(len(entered),6)
+        self.assertEqual(len(entered),8)
 
     def test_waiting_for_host_slot_honors_pause(self):
         control=DownloadControl()
         result=[]
         with contextlib.ExitStack() as stack:
-            for _ in range(4):
+            for _ in range(6):
                 stack.enter_context(control.transfer("https://same.example/file"))
             def wait_for_slot():
                 try:

@@ -1123,13 +1123,13 @@ def matching_audio_variant(qualities, headers, ffmpeg, control=None):
         return proc.stdout.strip() if proc.returncode == 0 else None
 
     try:
-        with ThreadPoolExecutor(max_workers=4,thread_name_prefix="audio-probe") as pool:
+        with ThreadPoolExecutor(max_workers=6,thread_name_prefix="audio-probe") as pool:
             low_future=pool.submit(segments,low)
             high_future=pool.submit(segments,high)
             small,large=low_future.result(),high_future.result()
             if not small or not large or len(small[0]) != len(large[0]) or small[1] != large[1]:
                 return None
-            indexes=sorted({0,len(small[0])-1})
+            indexes=sorted({0,len(small[0])//2,len(small[0])-1})
             pairs=[(pool.submit(audio_hash,small[0][index]),
                     pool.submit(audio_hash,large[0][index])) for index in indexes]
             for low_hash,high_hash in pairs:

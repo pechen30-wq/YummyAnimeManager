@@ -96,6 +96,13 @@ class AudioOptimizationTests(unittest.TestCase):
                    SimpleNamespace(returncode=0,stdout=kw["input"])):
             self.assertIsNone(matching_audio_variant(qualities,{},"ffmpeg"))
 
+        with patch("main.media_playlist", side_effect=lambda url, _headers: (playlist,url.replace(".m3u8","/"))), \
+             patch("main.requests.get", side_effect=get), \
+             patch("main.subprocess.run", side_effect=lambda _args, **kw:
+                   SimpleNamespace(returncode=0,stdout=(
+                       b"different" if b"/high/1.ts" in kw["input"] else b"same"))):
+            self.assertIsNone(matching_audio_variant(qualities,{},"ffmpeg"))
+
         control=DownloadControl()
         control.request("paused")
         with self.assertRaises(PauseDownload):

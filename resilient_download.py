@@ -67,7 +67,7 @@ class DownloadControl:
         self._mode = "running"
         self._processes = set()
         self._global_slots = threading.BoundedSemaphore(8)
-        self._host_slots = defaultdict(lambda: threading.BoundedSemaphore(4))
+        self._host_slots = defaultdict(lambda: threading.BoundedSemaphore(6))
         self._active_transfers = 0
         self._received_bytes = 0
         self._recent_bytes = deque()
