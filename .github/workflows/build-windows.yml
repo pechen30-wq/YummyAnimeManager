@@ -51,6 +51,17 @@ jobs:
           python test_plexmatch.py
       - name: Build executable
         run: python -m PyInstaller --noconfirm --clean YummyAnimeManager.spec
+      - name: Smoke-test executable
+        shell: pwsh
+        run: |
+          $process = Start-Process -FilePath "dist\YummyAnimeManager.exe" -ArgumentList "--self-test" -WindowStyle Hidden -PassThru
+          if (-not $process.WaitForExit(30000)) {
+            Stop-Process -Id $process.Id -Force
+            throw "Packaged application self-test timed out"
+          }
+          if ($process.ExitCode -ne 0) {
+            throw "Packaged application self-test failed with exit code $($process.ExitCode)"
+          }
       - name: Build update files
         run: python scripts/build_update_payload.py
       - uses: actions/upload-artifact@v4

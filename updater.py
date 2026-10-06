@@ -15,7 +15,7 @@ from pathlib import Path
 import requests
 
 from diagnostics import LOGGER
-from resilient_download import download_file
+from resilient_download import download_file, download_ranges
 
 
 RAW_BASE = "https://raw.githubusercontent.com/pechen30-wq/YummyAnimeManager/main/dist/"
@@ -100,14 +100,54 @@ def sha256_file(path):
 def download_verified(asset, destination, progress_cb=lambda *_: None):
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    download_file(asset["url"], destination, {}, progress_cb, attempts=5)
+
+    if destination.is_file() and destination.stat().st_size == asset["size"]:
+        progress_cb(96, "Проверяю уже скачанное обновление…")
+        if sha256_file(destination) == asset["sha256"]:
+            progress_cb(100, "Обновление готово")
+            return destination
+
+    def report(percent, message):
+        message = (message.replace("MP4 — ", "")
+                          .replace("MP4 · ", "")
+                          .replace("MP4 полностью скачан", "Файл скачан"))
+        progress_cb(min(95, int(percent * 0.95)), message)
+
+    # GitHub Raw supports byte ranges. Four independent connections are much
+    # faster on high-latency routes and the verified block ledger lets a new
+    # application process continue an interrupted update.
+    if destination.suffix.lower() == ".exe" and asset["size"] >= 8 * 1024 * 1024:
+        download_ranges(asset["url"], destination, {}, report,
+                        block_size=4 * 1024 * 1024, attempts=5,
+                        workers=4, resume=True)
+    else:
+        download_file(asset["url"], destination, {}, report,
+                      attempts=5, resume=True)
+    progress_cb(96, "Проверяю целостность обновления…")
     actual_size = destination.stat().st_size
     actual_hash = sha256_file(destination)
     if actual_size != asset["size"] or actual_hash != asset["sha256"]:
         destination.unlink(missing_ok=True)
         raise RuntimeError("Скачанное обновление не прошло проверку размера и SHA-256.")
     LOGGER.info("Verified update asset %s size=%s",destination.name,actual_size)
+    progress_cb(100, "Обновление готово")
     return destination
+
+
+def validate_executable(path, *, timeout=30):
+    """Run the packaged application's import-only smoke test before replacing it."""
+    path = Path(path).resolve()
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        result = subprocess.run([str(path), "--self-test"], cwd=path.parent,
+                                capture_output=True, text=True, timeout=timeout,
+                                creationflags=flags)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("Проверка запуска обновления не завершилась вовремя.") from error
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "неизвестная ошибка").strip()[-500:]
+        raise RuntimeError(f"Обновление не прошло проверку запуска: {detail}")
+    LOGGER.info("Update executable self-test passed: %s", path.name)
 
 
 def update_git_checkout(root):

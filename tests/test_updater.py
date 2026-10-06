@@ -75,6 +75,38 @@ class UpdaterTests(unittest.TestCase):
             self.assertEqual((root / "main.py").read_text(encoding="utf-8"), "old")
             self.assertFalse((root / "VERSION").exists())
 
+    def test_large_executable_uses_resumable_parallel_ranges(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "update.exe"
+            data = b"verified update"
+            asset = {"url": updater.RAW_BASE + "YummyAnimeManager.exe",
+                     "sha256": hashlib.sha256(data).hexdigest(),
+                     "size": 9 * 1024 * 1024}
+
+            def download(_url, path, _headers, progress, **kwargs):
+                Path(path).write_bytes(data)
+                asset["size"] = len(data)
+                progress(100, "MP4 полностью скачан")
+
+            progress = []
+            with patch.object(updater, "download_ranges", side_effect=download) as ranged, \
+                 patch.object(updater, "download_file") as sequential:
+                updater.download_verified(asset, destination,
+                                           lambda *values: progress.append(values))
+            self.assertTrue(ranged.call_args.kwargs["resume"])
+            self.assertEqual(ranged.call_args.kwargs["workers"], 4)
+            sequential.assert_not_called()
+            self.assertEqual(progress[-1], (100, "Обновление готово"))
+
+    def test_executable_self_test_failure_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "update.exe"
+            executable.write_bytes(b"exe")
+            failed = Mock(returncode=1, stdout="", stderr="python DLL missing")
+            with patch.object(updater.subprocess, "run", return_value=failed):
+                with self.assertRaisesRegex(RuntimeError, "python DLL missing"):
+                    updater.validate_executable(executable)
+
 
 if __name__ == "__main__":
     unittest.main()

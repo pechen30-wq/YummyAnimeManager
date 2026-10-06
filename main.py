@@ -31,7 +31,7 @@ from resolvers import (
 )
 from PySide6.QtCore import Qt, QThread, Signal, QUrl, QTimer
 from updater import (download_verified, fetch_manifest,
-                     newer_version, schedule_exe_replacement)
+                     newer_version, schedule_exe_replacement, validate_executable)
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "YummyAnime Manager"
-APP_VERSION = "4.8.2"
+APP_VERSION = "4.8.3"
 YUMMY_API_BASE = "https://api.yani.tv"
 CVH_API_BASE = "https://plapi.cdnvideohub.com/api/v1/player/sv"
 
@@ -1478,6 +1478,8 @@ class UpdateDownloadThread(QThread):
     def run(self):
         try:
             download_verified(self.asset, self.destination, self.progress.emit)
+            self.progress.emit(99, "Проверяю запуск обновления…")
+            validate_executable(self.destination)
             self.ready.emit(str(self.destination))
         except Exception as error:
             LOGGER.exception("Update download failed")
@@ -2449,6 +2451,8 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    if "--self-test" in sys.argv:
+        sys.exit(0)
     install_exception_hooks()
     app.setApplicationName(APP_NAME)
     win = MainWindow()
