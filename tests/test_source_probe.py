@@ -81,6 +81,13 @@ class SourceProbeTests(unittest.TestCase):
         health.succeeded(cvh,0.01,1000)
         self.assertEqual(health.sort([cvh,kodik])[0],cvh)
 
+    def test_unsupported_sample_preserves_baseline_order(self):
+        health=SourceHealth(); self.addCleanup(health.close)
+        cvh=VideoItem(1,"CVH","Voice","1",1,"")
+        kodik=VideoItem(2,"Kodik","Voice","1",1,"")
+        self.assertEqual(health.prepare([kodik,cvh],lambda _item:None),[cvh,kodik])
+        self.assertEqual(health.stats,{})
+
     def test_probe_failure_does_not_prevent_fallback(self):
         health=SourceHealth(); self.addCleanup(health.close)
         cvh=VideoItem(1,"CVH","Voice","1",1,"")

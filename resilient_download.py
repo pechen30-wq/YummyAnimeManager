@@ -81,7 +81,7 @@ def probe_media(url,headers,control=None,*,sample_limit=256*1024,budget=12,sessi
     try:
         path=urllib.parse.urlsplit(url).path.lower()
         if path.endswith(".mpd"):
-            raise ValueError("DASH source probing is not supported")
+            return None
         duration=None
         total_duration=None
         if path.endswith(".m3u8"):
@@ -165,8 +165,8 @@ class DownloadControl:
         self._event = threading.Event()
         self._mode = "running"
         self._processes = set()
-        self._global_slots = threading.BoundedSemaphore(8)
-        self._host_slots = defaultdict(lambda: threading.BoundedSemaphore(6))
+        self._global_slots = threading.BoundedSemaphore(12)
+        self._host_slots = defaultdict(lambda: threading.BoundedSemaphore(8))
         self._active_transfers = 0
         self._received_bytes = 0
         self._recent_bytes = deque()

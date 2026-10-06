@@ -1032,6 +1032,9 @@ class SourceHealth:
         try:
             started=time.monotonic()
             measurement=probe(item)
+            if measurement is None:
+                LOGGER.info("Audio source probe skipped for unsupported transport: provider=%s",provider_kind(item))
+                return
             elapsed=time.monotonic()-started
             with self.lock:
                 stat=self.stats.setdefault(self.key(item),{})
@@ -1628,6 +1631,9 @@ class WorkThread(QThread):
 
     def probe_audio_source(self,item):
         self.control.check()
+        if provider_kind(item)=="alloha":
+            # A small preflight must not install/start Chromium or a resolver.
+            return None
         resolver=PlayerResolver(self.resolver_config)
         stream=None
         try:
@@ -1750,8 +1756,13 @@ class WorkThread(QThread):
                         if not future.done():
                             self.emit_progress(ep_index,total_eps,dub_start,
                                                f"Серия {ep_label}: {dub} — ожидаю предварительную загрузку…")
+                        last_wait_status=0
                         while not future.done():
                             self.control.check()
+                            if time.monotonic()-last_wait_status>=1:
+                                self.emit_progress(ep_index,total_eps,dub_start,
+                                                   f"Серия {ep_label}: {dub} — загрузка озвучек…")
+                                last_wait_status=time.monotonic()
                             fill_audio_prefetch(self.episode_items[ep]["__video__"])
                             active=[task for task in prefetch.values() if not task.done()]
                             if active:
