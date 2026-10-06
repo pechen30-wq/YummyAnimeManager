@@ -11,11 +11,110 @@ import urllib.parse
 from collections import defaultdict, deque
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from pathlib import Path
 
 import requests
 from diagnostics import LOGGER, safe_url
+
+
+@dataclass(frozen=True)
+class SourceProbe:
+    latency: float
+    bytes_per_second: float
+    expected_bytes: int
+    sampled_bytes: int
+    host: str
+
+    @property
+    def estimated_seconds(self):
+        return self.latency + (self.expected_bytes or 64*1024*1024)/max(1,self.bytes_per_second)
+
+
+def probe_media(url,headers,control=None,*,sample_limit=256*1024,budget=12,session=None):
+    """Read at most one small media range and bounded HLS manifests."""
+    from hls_download import playlist_variant
+    started=time.monotonic()
+    deadline=started+budget
+    owned=session is None
+    session=session or requests.Session()
+    sampled=0
+
+    def check():
+        if control: control.check()
+        if time.monotonic()>=deadline:
+            raise TimeoutError("Source sample time budget exceeded")
+
+    def request(target,manifest=False):
+        nonlocal sampled
+        check()
+        request_headers=dict(headers or {})
+        request_headers["Accept-Encoding"]="identity"
+        if not manifest:
+            request_headers["Range"]=f"bytes=0-{sample_limit-1}"
+        begin=time.monotonic()
+        timeout=max(0.1,min(4,deadline-begin))
+        with (control.transfer(target) if control else contextlib.nullcontext()), session.get(
+                target,headers=request_headers,stream=True,timeout=(min(3,timeout),timeout)) as response:
+            response.raise_for_status()
+            response_headers=response.headers.copy()
+            final_url=response.url
+            body=bytearray()
+            first_byte=None
+            for chunk in response.iter_content(16384):
+                check()
+                if not chunk: continue
+                if first_byte is None: first_byte=time.monotonic()
+                sampled+=len(chunk)
+                if control: control.record_bytes(len(chunk))
+                body.extend(chunk[:sample_limit-len(body)])
+                if len(body)>=sample_limit:
+                    if manifest:
+                        raise ValueError("Manifest exceeds source probe size budget")
+                    break
+            if not body:
+                raise ValueError("Empty source sample")
+        elapsed=max(0.001,time.monotonic()-begin)
+        return bytes(body),response_headers,final_url,(first_byte or begin)-begin,len(body)/elapsed
+
+    try:
+        path=urllib.parse.urlsplit(url).path.lower()
+        if path.endswith(".mpd"):
+            raise ValueError("DASH source probing is not supported")
+        duration=None
+        total_duration=None
+        if path.endswith(".m3u8"):
+            for _ in range(4):
+                data,_metadata,base,_latency,_speed=request(url,manifest=True)
+                body=data.decode("utf-8-sig")
+                if not body.lstrip().startswith("#EXTM3U"):
+                    raise ValueError("Invalid HLS manifest")
+                if "#EXTINF:" in body:
+                    durations=[float(value) for value in re.findall(r"(?m)^#EXTINF:([0-9.]+)",body)]
+                    segments=[urllib.parse.urljoin(base,line.strip()) for line in body.splitlines()
+                              if line.strip() and not line.startswith("#")]
+                    if len(segments)!=len(durations) or not segments or "#EXT-X-BYTERANGE:" in body:
+                        raise ValueError("Unsupported HLS sample layout")
+                    index=max(range(len(durations)),key=lambda index:durations[index])
+                    url=segments[index]
+                    duration=durations[index]
+                    total_duration=sum(durations)
+                    break
+                url=urllib.parse.urljoin(base,playlist_variant(body,audio_only=True))
+            else:
+                raise ValueError("HLS nesting exceeds source probe budget")
+        data,metadata,final_url,latency,speed=request(url)
+        content_type=metadata.get("Content-Type","").lower()
+        if "text/" in content_type or "json" in content_type or "xml" in content_type:
+            raise ValueError("Source returned a document instead of media")
+        match=re.search(r"/(\d+)$",metadata.get("Content-Range",""))
+        total=int(match.group(1)) if match else int(metadata.get("Content-Length") or 0)
+        if duration and total_duration:
+            total=int(total*total_duration/duration)
+        return SourceProbe(latency,speed,total,sampled,urllib.parse.urlsplit(final_url).hostname or "")
+    finally:
+        if owned: session.close()
 
 
 RETRYABLE = (

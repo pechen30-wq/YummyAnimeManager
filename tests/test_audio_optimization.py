@@ -49,6 +49,19 @@ class AudioOptimizationTests(unittest.TestCase):
         interrupted.observe_network(59,5900,2)
         self.assertEqual(interrupted.samples,[])
 
+    def test_adaptive_limit_does_not_compare_different_sources(self):
+        policy=AdaptiveAudioPolicy()
+        for now in (0,20,40,60): policy.observe_network(now,now*1000,2,"cvh@cdn")
+        self.assertEqual(policy.limit,3)
+        policy.observe_network(61,61000,3,"kodik@cdn")
+        self.assertEqual(policy.limit,2)
+        self.assertEqual(policy.phase,"baseline")
+        for now in (62,82,102,122): policy.observe_network(now,61000+(now-61)*100,2,"kodik@cdn")
+        self.assertEqual(policy.limit,3)
+        for now in (123,143,163,183): policy.observe_network(now,67200+(now-123)*140,3,"kodik@cdn")
+        self.assertEqual(policy.limit,3)
+        self.assertEqual(policy.phase,"stable")
+
     def test_fast_kodik_audio_keeps_video_quality_and_skips_comparison(self):
         qualities={"720p":"https://cdn.test/high.m3u8?token=example",
                    "360p":"https://cdn.test/low.m3u8?token=example"}

@@ -19,7 +19,7 @@ from typing import Any
 
 import requests
 from resilient_download import (download_file, download_ranges, RangeUnsupportedError,
-                                RangeDownloadError, DownloadControl, PauseDownload, StopDownload)
+                                RangeDownloadError, DownloadControl, PauseDownload, StopDownload, probe_media)
 from hls_download import stage_hls, media_playlist
 from chapters import aniskip_points, inspect_media, remux_to_mkv
 from process_utils import hidden_subprocess_kwargs
@@ -43,7 +43,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "YummyAnime Manager"
-APP_VERSION = "4.8.6"
+APP_VERSION = "4.8.7"
 YUMMY_API_BASE = "https://api.yani.tv"
 CVH_API_BASE = "https://plapi.cdnvideohub.com/api/v1/player/sv"
 
@@ -995,6 +995,65 @@ class SourceHealth:
     def __init__(self):
         self.lock=threading.Lock()
         self.stats={}
+        self.probes={}
+        self.probe_pool=None
+
+    def prepare(self,candidates,probe,control=None):
+        """Sample up to three competing sources, sharing probes across voices."""
+        representatives={}
+        for item in self.sort(candidates):
+            representatives.setdefault(self.key(item),item)
+        if len(representatives)<2:
+            return self.sort(candidates)
+        futures=[]
+        with self.lock:
+            now=time.monotonic()
+            for key,item in list(representatives.items())[:3]:
+                if now-self.stats.get(key,{}).get("completed_at",-1000)<600:
+                    continue
+                cached=self.probes.get(key)
+                if cached is None or (cached[1].done() and now-cached[0]>=600):
+                    if self.probe_pool is None:
+                        self.probe_pool=ThreadPoolExecutor(max_workers=2,thread_name_prefix="source-probe")
+                    cached=(now,self.probe_pool.submit(self._measure,item,probe))
+                    self.probes[key]=cached
+                futures.append(cached[1])
+        for future in futures:
+            while True:
+                if control: control.check()
+                try:
+                    future.result(timeout=0.25)
+                    break
+                except TimeoutError:
+                    if future.done(): raise
+        return self.sort(candidates)
+
+    def _measure(self,item,probe):
+        try:
+            started=time.monotonic()
+            measurement=probe(item)
+            elapsed=time.monotonic()-started
+            with self.lock:
+                stat=self.stats.setdefault(self.key(item),{})
+                stat["probe_seconds"]=measurement.estimated_seconds+elapsed
+                stat["probe_failed"]=False
+            LOGGER.info("Audio source probe: provider=%s cdn=%s latency=%.3f network_bps=%.0f "
+                        "sample_bytes=%s expected_bytes=%s seconds=%.2f",
+                        provider_kind(item),measurement.host,measurement.latency,
+                        measurement.bytes_per_second,measurement.sampled_bytes,
+                        measurement.expected_bytes,elapsed)
+        except (PauseDownload,StopDownload):
+            raise
+        except Exception as error:
+            with self.lock:
+                self.stats.setdefault(self.key(item),{})["probe_failed"]=True
+            LOGGER.info("Audio source probe unavailable: provider=%s error=%s",
+                        provider_kind(item),type(error).__name__)
+
+    def close(self):
+        if self.probe_pool is not None:
+            self.probe_pool.shutdown(wait=True,cancel_futures=True)
+            self.probe_pool=None
 
     @staticmethod
     def key(item):
@@ -1006,7 +1065,9 @@ class SourceHealth:
             def score(item):
                 provider=provider_kind(item)
                 stat=self.stats.get(self.key(item),{})
-                estimate=stat.get("seconds",self.BASELINE.get(provider,360))
+                estimate=stat.get("seconds",stat.get("probe_seconds",self.BASELINE.get(provider,360)))
+                if stat.get("probe_failed") and "seconds" not in stat:
+                    estimate+=600
                 return (stat.get("cooldown",0)>now,
                         estimate+120*stat.get("failures",0),stat.get("failures",0))
             return sorted(candidates,key=score)
@@ -1017,6 +1078,7 @@ class SourceHealth:
             stat["seconds"]=(stat.get("seconds",elapsed)+elapsed)/2
             stat["failures"]=0
             stat["cooldown"]=0
+            stat["completed_at"]=time.monotonic()
         LOGGER.info("Audio source completed: provider=%s seconds=%.2f output_bytes=%s",
                     provider_kind(item),elapsed,size)
 
@@ -1040,6 +1102,7 @@ class AdaptiveAudioPolicy:
         self.samples=[]
         self.errors=0
         self.window=None
+        self.profile=None
 
     def failed(self):
         with self.lock:
@@ -1049,8 +1112,24 @@ class AdaptiveAudioPolicy:
             self.window=None
             LOGGER.info("Audio parallelism remains at 2 tracks after source errors")
 
-    def observe_network(self,now,total_bytes,active_tracks):
+    def observe_network(self,now,total_bytes,active_tracks,profile="default"):
         with self.lock:
+            if not profile:
+                self.window=None
+                if self.phase=="trial":
+                    self.phase="baseline"
+                    self.limit=2
+                    self.samples=[]
+                return
+            if self.profile is not None and self.profile!=profile:
+                self.phase="baseline"
+                self.limit=2
+                self.samples=[]
+                self.window=None
+                self.baseline=0
+                self.errors=0
+                LOGGER.info("Audio parallelism measurement restarted for changed source/CDN")
+            self.profile=profile
             if self.phase=="stable":
                 return
             if active_tracks!=self.limit:
@@ -1198,6 +1277,7 @@ class WorkThread(QThread):
         self._shared_audio={}
         self._video_resource=None
         self._active_tracks=set()
+        self._active_sources={}
         self._tracks_lock=threading.Lock()
         self.checkpoint=checkpoint
         self.control=DownloadControl()
@@ -1219,15 +1299,17 @@ class WorkThread(QThread):
         self.progress.emit(series_pct,max(0,min(100,overall)),status)
 
     @contextlib.contextmanager
-    def active_audio(self,dub):
+    def active_audio(self,dub,source=""):
         with self._tracks_lock:
             self._active_tracks.add(dub)
+            self._active_sources[dub]=source
         self.observe_audio_network()
         try:
             yield
         finally:
             with self._tracks_lock:
                 self._active_tracks.discard(dub)
+                self._active_sources.pop(dub,None)
             self.observe_audio_network()
     def resolve_stream(self,item, audio_only=False):
         resolver=getattr(self._resolver_local,"resolver",self.resolver)
@@ -1499,7 +1581,10 @@ class WorkThread(QThread):
         try:
             self.control.check()
             candidates=self.episode_items[ep].get("__audio_candidates__",{}).get(dub,[self.episode_items[ep][dub]])
-            for item in self.source_health.sort(candidates):
+            ordered=(self.source_health.prepare(candidates,self.probe_audio_source,self.control)
+                     if self.resolver_config.get("probe_audio_sources",True)
+                     else self.source_health.sort(candidates))
+            for item in ordered:
                 stream=None
                 started=time.monotonic()
                 try:
@@ -1507,7 +1592,7 @@ class WorkThread(QThread):
                     qtag=safe_name(stream.quality or "auto")
                     dest=temp_dir/f"{safe_name(dub)} [{qtag}]{self.extension_for(stream)}"
                     temp_dir.mkdir(parents=True,exist_ok=True)
-                    with self.active_audio(dub):
+                    with self.active_audio(dub,stream.source+"@"+(urllib.parse.urlsplit(stream.url).hostname or "")):
                         dest=self.download_audio_shared(stream,dest,item,self.observe_audio_network)
                     self.control.check()
                     if self.checkpoint: self.checkpoint.mark_file(f"{ep}:{dub}",dest,item)
@@ -1537,7 +1622,28 @@ class WorkThread(QThread):
     def observe_audio_network(self,*_args):
         with self._tracks_lock:
             tracks=len(self._active_tracks)
-        self.audio_policy.observe_network(time.monotonic(),self.control.transfer_stats()[2],tracks)
+            sources=set(self._active_sources.values())
+            profile=next(iter(sources)) if len(sources)==1 else ""
+        self.audio_policy.observe_network(time.monotonic(),self.control.transfer_stats()[2],tracks,profile)
+
+    def probe_audio_source(self,item):
+        self.control.check()
+        resolver=PlayerResolver(self.resolver_config)
+        stream=None
+        try:
+            stream=resolver.resolve(item)
+            self.control.check()
+            _label,url=choose_stream(stream,"Лучшее")
+            master=(stream.qualities or {}).get("auto")
+            if master and urllib.parse.urlsplit(master).path.lower().endswith(".m3u8"):
+                url=master
+            elif stream.source=="kodik" and self.resolver_config.get("fast_kodik_audio",False):
+                variants=numeric_hls_variants(stream.qualities or {})
+                if variants: url=variants[0][1]
+            return probe_media(url,stream.headers,self.control,session=resolver.session)
+        finally:
+            if stream is not None: PlayerResolver.release(stream)
+            resolver.session.close()
 
     def download_audio_shared(self, stream, dest, item, progress_cb):
         """One writer for an identical resolved URL and request context."""
@@ -1837,6 +1943,7 @@ class WorkThread(QThread):
             if self._audio_pool is not None:
                 self._audio_pool.shutdown(wait=True,cancel_futures=True)
                 self._audio_pool=None
+            self.source_health.close()
 
 
 class UpdateCheckThread(QThread):
