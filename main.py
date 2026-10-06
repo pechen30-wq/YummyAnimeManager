@@ -14,7 +14,7 @@ import urllib.parse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from typing import Any
 
 import requests
@@ -43,7 +43,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "YummyAnime Manager"
-APP_VERSION = "4.8.5"
+APP_VERSION = "4.8.6"
 YUMMY_API_BASE = "https://api.yani.tv"
 CVH_API_BASE = "https://plapi.cdnvideohub.com/api/v1/player/sv"
 
@@ -1031,7 +1031,7 @@ class SourceHealth:
 
 
 class AdaptiveAudioPolicy:
-    """Trial a third track only if measured throughput improves without errors."""
+    """Compare aggregate HTTP throughput at two and three active tracks."""
     def __init__(self):
         self.lock=threading.Lock()
         self.limit=2
@@ -1039,30 +1039,48 @@ class AdaptiveAudioPolicy:
         self.baseline=0
         self.samples=[]
         self.errors=0
+        self.window=None
 
-    def observe(self,seconds,size,failed=False):
+    def failed(self):
         with self.lock:
-            if failed:
-                self.errors+=1
-            elif seconds>0 and size>0:
-                self.samples.append(size/seconds)
-            if self.phase=="baseline" and len(self.samples)+self.errors>=4:
-                if self.errors:
-                    self.phase="stable"
-                    LOGGER.info("Audio parallelism remains at 2 tracks after source errors")
-                else:
-                    self.baseline=sum(self.samples)/len(self.samples)
-                    self.samples=[]
-                    self.limit=3
-                    self.phase="trial"
-                    LOGGER.info("Audio parallelism trial: 3 tracks")
-                self.errors=0
-            elif self.phase=="trial" and len(self.samples)+self.errors>=4:
-                throughput=sum(self.samples)/len(self.samples) if self.samples else 0
-                if self.errors or throughput*3<self.baseline*2*1.1:
+            self.errors+=1
+            self.limit=2
+            self.phase="stable"
+            self.window=None
+            LOGGER.info("Audio parallelism remains at 2 tracks after source errors")
+
+    def observe_network(self,now,total_bytes,active_tracks):
+        with self.lock:
+            if self.phase=="stable":
+                return
+            if active_tracks!=self.limit:
+                self.window=None
+                return
+            if self.window is None:
+                self.window=(now,total_bytes)
+                return
+            started,initial_bytes=self.window
+            if now-started<20:
+                return
+            self.samples.append(max(0,total_bytes-initial_bytes)/(now-started))
+            self.window=(now,total_bytes)
+            if len(self.samples)<3:
+                return
+            throughput=sum(self.samples)/len(self.samples)
+            self.samples=[]
+            self.window=None
+            if self.phase=="baseline":
+                if throughput<=0:
+                    return
+                self.baseline=throughput
+                self.limit=3
+                self.phase="trial"
+                LOGGER.info("Audio parallelism trial: 3 tracks baseline_network_bps=%.0f",throughput)
+            else:
+                if throughput<self.baseline*1.1:
                     self.limit=2
                 self.phase="stable"
-                LOGGER.info("Audio parallelism chosen: %s tracks baseline=%.0f trial=%.0f errors=%s",
+                LOGGER.info("Audio parallelism chosen: %s tracks baseline_network_bps=%.0f trial_network_bps=%.0f errors=%s",
                             self.limit,self.baseline,throughput,self.errors)
 
 
@@ -1076,12 +1094,16 @@ def source_attempt_order(candidates, health=None, audio_only=False):
             for item, limit in zip(candidates, limits) if round_index < limit]
 
 
+def numeric_hls_variants(qualities):
+    return sorted((int(match.group(1)), url, label)
+                  for label, url in qualities.items()
+                  if (match := re.fullmatch(r"(\d+)p", str(label)))
+                  and urllib.parse.urlsplit(url).path.lower().endswith(".m3u8"))
+
+
 def matching_audio_variant(qualities, headers, ffmpeg, control=None):
     """Use a smaller Kodik variant only when sampled audio packets are identical."""
-    numeric = sorted((int(match.group(1)), url, label)
-                     for label, url in qualities.items()
-                     if (match := re.fullmatch(r"(\d+)p", str(label)))
-                     and urllib.parse.urlsplit(url).path.lower().endswith(".m3u8"))
+    numeric = numeric_hls_variants(qualities)
     if len(numeric) < 2 or not ffmpeg:
         return None
     low, high = numeric[0], numeric[-1]
@@ -1200,11 +1222,13 @@ class WorkThread(QThread):
     def active_audio(self,dub):
         with self._tracks_lock:
             self._active_tracks.add(dub)
+        self.observe_audio_network()
         try:
             yield
         finally:
             with self._tracks_lock:
                 self._active_tracks.discard(dub)
+            self.observe_audio_network()
     def resolve_stream(self,item, audio_only=False):
         resolver=getattr(self._resolver_local,"resolver",self.resolver)
         result=resolver.resolve(item); label,url=choose_stream(result,"Лучшее" if audio_only else self.quality)
@@ -1214,6 +1238,13 @@ class WorkThread(QThread):
             if master and urllib.parse.urlparse(master).path.lower().endswith(".m3u8"):
                 url = master
             if result.source == "kodik" and url == result.url:
+                variants=numeric_hls_variants(result.qualities or {})
+                if self.resolver_config.get("fast_kodik_audio",False) and variants:
+                    _,url,label=variants[0]
+                    LOGGER.info("Fast Kodik audio: dubbing=%s quality=%s",item.dubbing,label)
+                    result.audio_only=True
+                    result.url=url; result.quality=label
+                    return result
                 key=(tuple(sorted((result.qualities or {}).items())),
                      tuple(sorted((result.headers or {}).items())))
                 with self._variant_lock:
@@ -1477,11 +1508,10 @@ class WorkThread(QThread):
                     dest=temp_dir/f"{safe_name(dub)} [{qtag}]{self.extension_for(stream)}"
                     temp_dir.mkdir(parents=True,exist_ok=True)
                     with self.active_audio(dub):
-                        dest=self.download_audio_shared(stream,dest,item,lambda *_: None)
+                        dest=self.download_audio_shared(stream,dest,item,self.observe_audio_network)
                     self.control.check()
                     if self.checkpoint: self.checkpoint.mark_file(f"{ep}:{dub}",dest,item)
                     self.source_health.succeeded(item,time.monotonic()-started,dest.stat().st_size)
-                    self.audio_policy.observe(time.monotonic()-started,dest.stat().st_size)
                     LOGGER.info("Audio prefetched: episode=%s dubbing=%s provider=%s",
                                 ep,dub,stream.source)
                     return dest,item
@@ -1489,7 +1519,7 @@ class WorkThread(QThread):
                     raise
                 except Exception as error:
                     self.source_health.failed(item,error)
-                    self.audio_policy.observe(0,0,failed=True)
+                    self.audio_policy.failed()
                     LOGGER.warning("Audio prefetch attempt failed: episode=%s dubbing=%s provider=%s error=%s",
                                    ep,dub,provider_kind(item),error)
                 finally:
@@ -1503,6 +1533,11 @@ class WorkThread(QThread):
         finally:
             resolver.session.close()
             del self._resolver_local.resolver
+
+    def observe_audio_network(self,*_args):
+        with self._tracks_lock:
+            tracks=len(self._active_tracks)
+        self.audio_policy.observe_network(time.monotonic(),self.control.transfer_stats()[2],tracks)
 
     def download_audio_shared(self, stream, dest, item, progress_cb):
         """One writer for an identical resolved URL and request context."""
@@ -1585,7 +1620,7 @@ class WorkThread(QThread):
                 def fill_audio_prefetch(video_item):
                     if not use_merge or len(self.dubbings)<2:
                         return
-                    while len(prefetch)<self.audio_policy.limit:
+                    while sum(not future.done() for future in prefetch.values())<self.audio_policy.limit:
                         next_name=next((name for name in self.dubbings
                                         if name!=video_item.dubbing and name not in scheduled),None)
                         if next_name is None:
@@ -1604,12 +1639,19 @@ class WorkThread(QThread):
                     if not item: errors.append(f"Серия {ep_label}: нет озвучки «{dub}»."); failed=True; break
                     prefetched=None
                     scheduled.add(dub)
-                    future=prefetch.pop(dub,None)
+                    future=prefetch.get(dub)
                     if future is not None:
                         if not future.done():
                             self.emit_progress(ep_index,total_eps,dub_start,
                                                f"Серия {ep_label}: {dub} — ожидаю предварительную загрузку…")
+                        while not future.done():
+                            self.control.check()
+                            fill_audio_prefetch(self.episode_items[ep]["__video__"])
+                            active=[task for task in prefetch.values() if not task.done()]
+                            if active:
+                                wait(active,timeout=0.25,return_when=FIRST_COMPLETED)
                         prefetched=future.result()
+                        prefetch.pop(dub,None)
                         fill_audio_prefetch(self.episode_items[ep]["__video__"])
                     cached=self.checkpoint.file(f"{ep}:{dub}") if self.checkpoint else None
                     if not cached and prefetched and Path(prefetched[0]).is_file():
@@ -2100,10 +2142,18 @@ class MainWindow(QMainWindow):
             "по MyAnimeList ID и длительности серии."
         )
         self.chapters_check.setChecked(bool(self.config.get("chapters_enabled", True)))
+        self.fast_audio_check = QCheckBox("Быстрая загрузка озвучек Kodik")
+        self.fast_audio_check.setToolTip(
+            "Извлекать звук из самого лёгкого потока той же озвучки. Это сокращает трафик, "
+            "но битрейт звука может отличаться от максимального. При выключении проверяется "
+            "точное совпадение звука с потоком максимального качества."
+        )
+        self.fast_audio_check.setChecked(bool(self.config.get("fast_kodik_audio", False)))
         self.mkv_status = QLabel("")
         merge_layout.addWidget(self.merge_check)
         merge_layout.addWidget(self.keep_sources)
         merge_layout.addWidget(self.chapters_check)
+        merge_layout.addWidget(self.fast_audio_check)
         merge_layout.addWidget(self.mkv_status)
         layout.addWidget(merge_box)
 
@@ -2690,6 +2740,8 @@ class MainWindow(QMainWindow):
         self.launch_download(selected_matrix)
 
     def launch_download(self, matrix):
+        self.config["fast_kodik_audio"]=self.fast_audio_check.isChecked()
+        save_config(self.config)
         settings=dict(self.checkpoint.payload["settings"])
         settings["episode_items"]=matrix
         settings["resolver_config"]=self.config

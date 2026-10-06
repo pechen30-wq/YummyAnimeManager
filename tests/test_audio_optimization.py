@@ -23,15 +23,62 @@ class AudioOptimizationTests(unittest.TestCase):
         health.failed(fast,RuntimeError("TLS"))
         self.assertEqual(health.sort([fast,slow])[0],slow)
         policy=AdaptiveAudioPolicy()
-        for _ in range(4): policy.observe(1,100)
+        for now in (0,20,40,60): policy.observe_network(now,now*100,2)
         self.assertEqual(policy.limit,3)
-        for _ in range(4): policy.observe(1,70)
+        for now in (60,80,100,120): policy.observe_network(now,6000+(now-60)*100,3)
         self.assertEqual(policy.limit,2)
         cautious=AdaptiveAudioPolicy()
-        cautious.observe(0,0,failed=True)
-        for _ in range(3): cautious.observe(1,100)
+        cautious.failed()
+        for now in (0,20,40,60): cautious.observe_network(now,now*100,2)
         self.assertEqual(cautious.limit,2)
         self.assertEqual(cautious.phase,"stable")
+
+    def test_adaptive_limit_uses_sustained_aggregate_network_throughput(self):
+        policy=AdaptiveAudioPolicy()
+        for now in (0,20,40,60): policy.observe_network(now,now*100,2)
+        policy.observe_network(80,20000,2)  # Third track has not started yet.
+        self.assertEqual(policy.phase,"trial")
+        for now in (80,100,120,140): policy.observe_network(now,20000+(now-80)*140,3)
+        self.assertEqual(policy.limit,3)
+        self.assertEqual(policy.phase,"stable")
+        interrupted=AdaptiveAudioPolicy()
+        interrupted.observe_network(0,0,2)
+        interrupted.observe_network(19,1900,2)
+        interrupted.observe_network(20,2000,1)
+        interrupted.observe_network(40,4000,2)
+        interrupted.observe_network(59,5900,2)
+        self.assertEqual(interrupted.samples,[])
+
+    def test_fast_kodik_audio_keeps_video_quality_and_skips_comparison(self):
+        qualities={"720p":"https://cdn.test/high.m3u8?token=example",
+                   "360p":"https://cdn.test/low.m3u8?token=example"}
+        item=VideoItem(1,"Kodik","A","1",1,"")
+        worker=WorkThread("Kodik",["A"],{},"720p",Path("."),"Test",False,"",False,
+                          resolver_config={"fast_kodik_audio":True})
+        def resolved(_item):
+            return StreamResult(qualities["720p"],"kodik",qualities,{},"720p")
+        with patch.object(worker.resolver,"resolve",side_effect=resolved), \
+             patch("main.matching_audio_variant") as compare:
+            video=worker.resolve_stream(item)
+            audio=worker.resolve_stream(item,audio_only=True)
+        self.assertEqual(video.url,qualities["720p"])
+        self.assertEqual(audio.url,qualities["360p"])
+        self.assertTrue(audio.audio_only)
+        compare.assert_not_called()
+        worker.resolver.session.close()
+
+    def test_strict_kodik_audio_retains_original_when_variants_differ(self):
+        qualities={"360p":"https://cdn.test/low.m3u8",
+                   "720p":"https://cdn.test/high.m3u8"}
+        item=VideoItem(1,"Kodik","A","1",1,"")
+        worker=WorkThread("Kodik",["A"],{},"720p",Path("."),"Test",False,"",False)
+        with patch.object(worker.resolver,"resolve",return_value=StreamResult(
+                qualities["720p"],"kodik",qualities,{},"720p")), \
+             patch("main.matching_audio_variant",return_value=None) as compare:
+            audio=worker.resolve_stream(item,audio_only=True)
+        self.assertEqual(audio.url,qualities["720p"])
+        compare.assert_called_once()
+        worker.resolver.session.close()
 
     def test_identical_audio_resource_has_one_writer(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -142,6 +189,37 @@ class AudioOptimizationTests(unittest.TestCase):
             self.assertEqual(peak,2)
             self.assertCountEqual(downloads,[item.dubbing for item in voices])
             merge.assert_called_once()
+
+    def test_finished_track_frees_slot_while_first_track_is_still_pending(self):
+        video=VideoItem(1,"CVH","Video","1",1,"")
+        voices=[VideoItem(index+2,"CVH",f"Voice {index}","1",1,"") for index in range(3)]
+        matrix={1.0:{"__video__":video,"Video":video,
+                     **{item.dubbing:item for item in voices}}}
+        next_started=threading.Event()
+        def download(_stream,path,item,_progress):
+            if item==voices[0]:
+                if not next_started.wait(timeout=3):
+                    raise RuntimeError("Finished second track did not free a slot")
+            elif item==voices[2]:
+                next_started.set()
+            path.parent.mkdir(parents=True,exist_ok=True)
+            path.write_bytes(b"media")
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); mkv=root/"mkvmerge.exe"; mkv.touch()
+            worker=WorkThread("CVH",[item.dubbing for item in voices]+["Video"],
+                              matrix,"720p",root,"Test",True,str(mkv),False,
+                              plexmatch_enabled=False,chapters_enabled=False)
+            with patch.object(worker,"resolve_stream",side_effect=lambda item,audio_only=False:
+                              StreamResult(f"https://cdn.test/{item.video_id}.mp4","direct",{}, {},
+                                           audio_only=audio_only)), \
+                 patch.object(worker,"download_stream",side_effect=download), \
+                 patch("main.PlayerResolver.release"), \
+                 patch("main.merge_audio_tracks") as merge:
+                worker.run()
+            self.assertTrue(next_started.is_set())
+            merge.assert_called_once()
+            self.assertEqual([name for _path,name in merge.call_args.args[1]],
+                             [item.dubbing for item in voices]+["Video"])
 
     def test_cached_video_still_prefetches_remaining_tracks(self):
         video=VideoItem(1,"CVH","Video","1",1,"")
