@@ -38,6 +38,26 @@ class Response:
 
 
 class DownloadTests(unittest.TestCase):
+    def test_pause_terminates_all_registered_processes(self):
+        control=DownloadControl()
+        processes=[Mock() for _ in range(2)]
+        for process in processes:
+            process.poll.return_value=None
+            control.set_process(process)
+        control.request("paused")
+        for process in processes:
+            process.kill.assert_called_once()
+
+    def test_process_started_after_pause_is_terminated(self):
+        control=DownloadControl()
+        control.request("paused")
+        process=Mock()
+        process.poll.return_value=None
+        with self.assertRaises(PauseDownload):
+            control.set_process(process)
+        process.kill.assert_called_once()
+        process.wait.assert_called_once()
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

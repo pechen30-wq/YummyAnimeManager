@@ -43,7 +43,7 @@ class DownloadControl:
         self._lock = threading.Lock()
         self._event = threading.Event()
         self._mode = "running"
-        self._process = None
+        self._processes = set()
 
     def request(self, mode):
         if mode not in ("paused", "stopped"):
@@ -51,8 +51,8 @@ class DownloadControl:
         with self._lock:
             self._mode = mode
             self._event.set()
-            process = self._process
-        if process is not None:
+            processes = tuple(self._processes)
+        for process in processes:
             try:
                 if process.poll() is None:
                     process.kill()
@@ -73,13 +73,24 @@ class DownloadControl:
 
     def set_process(self, process):
         with self._lock:
-            self._process = process
-        self.check()
+            self._processes.add(process)
+        try:
+            self.check()
+        except (PauseDownload, StopDownload):
+            try:
+                if process.poll() is None:
+                    process.kill()
+                process.wait()
+            finally:
+                self.clear_process(process)
+                close = getattr(process.stdout, "close", None)
+                if close:
+                    close()
+            raise
 
     def clear_process(self, process):
         with self._lock:
-            if self._process is process:
-                self._process = None
+            self._processes.discard(process)
 
 
 def download_file(url, path, headers, progress_cb, *, attempts=4, sleep=time.sleep,

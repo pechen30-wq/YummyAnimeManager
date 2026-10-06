@@ -13,12 +13,13 @@ import urllib.parse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import requests
 from resilient_download import (download_file, download_ranges, RangeUnsupportedError,
                                 RangeDownloadError, DownloadControl, PauseDownload, StopDownload)
-from hls_download import stage_hls
+from hls_download import stage_hls, media_playlist
 from chapters import aniskip_points, inspect_media, remux_to_mkv
 from process_utils import hidden_subprocess_kwargs
 from diagnostics import LOGGER, LOG_DIR, configure_logging, install_exception_hooks, safe_url
@@ -41,7 +42,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "YummyAnime Manager"
-APP_VERSION = "4.8.3"
+APP_VERSION = "4.8.4"
 YUMMY_API_BASE = "https://api.yani.tv"
 CVH_API_BASE = "https://plapi.cdnvideohub.com/api/v1/player/sv"
 
@@ -139,13 +140,17 @@ class DownloadCheckpoint:
 
     def save(self):
         with self.lock:
-            self.path.parent.mkdir(parents=True,exist_ok=True)
-            temporary=self.path.with_name(self.path.name+".tmp")
-            temporary.write_text(json.dumps(self.payload,ensure_ascii=False,indent=2),encoding="utf-8")
-            temporary.replace(self.path)
+            self._save_locked()
+
+    def _save_locked(self):
+        self.path.parent.mkdir(parents=True,exist_ok=True)
+        temporary=self.path.with_name(self.path.name+".tmp")
+        temporary.write_text(json.dumps(self.payload,ensure_ascii=False,indent=2),encoding="utf-8")
+        temporary.replace(self.path)
 
     def file(self,key):
-        record=self.payload.get("files",{}).get(key)
+        with self.lock:
+            record=self.payload.get("files",{}).get(key)
         if not record:
             return None
         path=Path(record["path"])
@@ -160,16 +165,18 @@ class DownloadCheckpoint:
     def mark_file(self,key,path,item):
         path=Path(path)
         stat=path.stat()
-        self.payload.setdefault("files",{})[key]={"path":str(path),"size":stat.st_size,
-                                                   "mtime_ns":stat.st_mtime_ns,"item":asdict(item)}
-        self.save()
+        with self.lock:
+            self.payload.setdefault("files",{})[key]={"path":str(path),"size":stat.st_size,
+                                                       "mtime_ns":stat.st_mtime_ns,"item":asdict(item)}
+            self._save_locked()
 
     def complete_episode(self,episode,path):
         path=Path(path)
         stat=path.stat()
-        self.payload.setdefault("episodes",{})[str(episode)]={"path":str(path),
-            "size":stat.st_size,"mtime_ns":stat.st_mtime_ns}
-        self.save()
+        with self.lock:
+            self.payload.setdefault("episodes",{})[str(episode)]={"path":str(path),
+                "size":stat.st_size,"mtime_ns":stat.st_mtime_ns}
+            self._save_locked()
 
     def episode_complete(self,episode):
         record=self.payload.get("episodes",{}).get(str(episode))
@@ -987,6 +994,56 @@ def source_attempt_order(candidates):
             for item, limit in zip(candidates, limits) if round_index < limit]
 
 
+def matching_audio_variant(qualities, headers, ffmpeg):
+    """Use a smaller Kodik variant only when sampled audio packets are identical."""
+    numeric = sorted((int(match.group(1)), url, label)
+                     for label, url in qualities.items()
+                     if (match := re.fullmatch(r"(\d+)p", str(label)))
+                     and urllib.parse.urlsplit(url).path.lower().endswith(".m3u8"))
+    if len(numeric) < 2 or not ffmpeg:
+        return None
+    low, high = numeric[0], numeric[-1]
+
+    def segments(entry):
+        body, base = media_playlist(entry[1], headers)
+        if any(tag in body for tag in ("#EXT-X-KEY:", "#EXT-X-BYTERANGE:", "#EXT-X-MAP:")):
+            return None
+        urls=[urllib.parse.urljoin(base, line.strip()) for line in body.splitlines()
+              if line.strip() and not line.startswith("#")]
+        durations=[round(float(value), 3) for value in
+                   re.findall(r"(?m)^#EXTINF:([0-9.]+)", body)]
+        return (urls,durations) if len(urls)==len(durations) else None
+
+    def audio_hash(url):
+        with requests.get(url, headers=headers, stream=True, timeout=(10, 25)) as response:
+            response.raise_for_status()
+            data = bytearray()
+            for chunk in response.iter_content(65536):
+                data.extend(chunk)
+                if len(data) > 8 * 1024 * 1024:
+                    return None
+        proc = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+                               "-map", "0:a:0", "-c:a", "copy", "-f", "hash", "-hash",
+                               "sha256", "pipe:1"], input=bytes(data), capture_output=True,
+                              timeout=15, **hidden_subprocess_kwargs())
+        return proc.stdout.strip() if proc.returncode == 0 else None
+
+    try:
+        small, large = segments(low), segments(high)
+        if not small or not large or len(small[0]) != len(large[0]) or small[1] != large[1]:
+            return None
+        for index in sorted({0, len(small[0]) // 2, len(small[0]) - 1}):
+            smaller, larger = audio_hash(small[0][index]), audio_hash(large[0][index])
+            if not smaller or smaller != larger:
+                return None
+        LOGGER.info("Equivalent Kodik audio verified at %s and %s; choosing %s",
+                    high[2], low[2], low[2])
+        return low[2], low[1]
+    except (OSError, requests.RequestException, subprocess.TimeoutExpired, ValueError, RuntimeError) as error:
+        LOGGER.debug("Audio variant comparison unavailable: %s", error)
+        return None
+
+
 class WorkThread(QThread):
     progress=Signal(int,int,str)
     done=Signal(str,object)
@@ -1006,20 +1063,36 @@ class WorkThread(QThread):
         self.resolver_config=resolver_config or {}; self.ffmpeg=ffmpeg_path or find_ffmpeg()
         self.chapters_enabled=chapters_enabled
         self.resolver=PlayerResolver(self.resolver_config)
+        self._resolver_local=threading.local()
+        self._progress_lock=threading.Lock()
+        self._progress_episode=None
+        self._progress_peak=0
+        self._audio_pool=None
         self.checkpoint=checkpoint
         self.control=DownloadControl()
     def emit_progress(self,ep_index,total_eps,series_pct,status):
         self.control.check()
         series_pct=max(0,min(100,int(series_pct)))
+        with self._progress_lock:
+            if self._progress_episode != ep_index:
+                self._progress_episode=ep_index
+                self._progress_peak=0
+            self._progress_peak=max(self._progress_peak,series_pct)
+            series_pct=self._progress_peak
         overall=int((((ep_index-1)+series_pct/100.0)/max(1,total_eps))*100)
         self.progress.emit(series_pct,max(0,min(100,overall)),status)
     def resolve_stream(self,item, audio_only=False):
-        result=self.resolver.resolve(item); label,url=choose_stream(result,"Лучшее" if audio_only else self.quality)
+        resolver=getattr(self._resolver_local,"resolver",self.resolver)
+        result=resolver.resolve(item); label,url=choose_stream(result,"Лучшее" if audio_only else self.quality)
         if audio_only:
             # Preserve the master playlist's separate audio renditions.
             master = (result.qualities or {}).get("auto") or result.url
             if master and urllib.parse.urlparse(master).path.lower().endswith(".m3u8"):
                 url = master
+            if result.source == "kodik" and url == result.url:
+                equivalent=matching_audio_variant(result.qualities or {}, result.headers or {}, self.ffmpeg)
+                if equivalent:
+                    label,url=equivalent
             result.audio_only = True
         result.url=url; result.quality=label; return result
     def ensure_chapters(self, media_path, item, episode, chapter_source=None):
@@ -1254,6 +1327,36 @@ class WorkThread(QThread):
         else:
             download_file(result.url, path, headers, progress_cb,
                           control=self.control,resume=bool(self.checkpoint))
+
+    def prefetch_audio(self, ep, dub, temp_dir):
+        """Prepare one additional track while the preceding track is processed."""
+        resolver=PlayerResolver(self.resolver_config)
+        self._resolver_local.resolver=resolver
+        stream=None
+        try:
+            self.control.check()
+            item=self.episode_items[ep].get("__audio_candidates__",{}).get(dub,[self.episode_items[ep][dub]])[0]
+            stream=self.resolve_stream(item,audio_only=True)
+            qtag=safe_name(stream.quality or "auto")
+            dest=temp_dir/f"{safe_name(dub)} [{qtag}]{self.extension_for(stream)}"
+            temp_dir.mkdir(parents=True,exist_ok=True)
+            self.download_stream(stream,dest,item,lambda *_: None)
+            self.control.check()
+            if self.checkpoint: self.checkpoint.mark_file(f"{ep}:{dub}",dest,item)
+            LOGGER.info("Audio prefetched: episode=%s dubbing=%s provider=%s",
+                        ep,dub,stream.source)
+            return dest,item
+        except (PauseDownload,StopDownload):
+            raise
+        except Exception as error:
+            LOGGER.warning("Audio prefetch failed: episode=%s dubbing=%s error=%s",
+                           ep,dub,error)
+            return False
+        finally:
+            if stream is not None: PlayerResolver.release(stream)
+            resolver.session.close()
+            del self._resolver_local.resolver
+
     def run(self):
         try:
             LOGGER.info("Download started: title=%s episodes=%s dubbings=%s quality=%s chapters=%s",
@@ -1290,16 +1393,40 @@ class WorkThread(QThread):
                 if self.checkpoint and "series_title" in self.checkpoint.payload.get("settings",{}):
                     staging=staging/f"season_{self.season_number:02d}"
                 temp_dir=staging/f"episode_{safe_name(ep_label)}"; failed=False
+                prefetch={}
                 self.emit_progress(ep_index,total_eps,0,f"Серия {ep_label} ({ep_index}/{len(episodes)}): подготовка…")
                 for dub_index,dub in enumerate(download_dubs,1):
                     item=self.episode_items[ep].get(dub); dub_start=(dub_index-1)*dub_span
                     self.emit_progress(ep_index,total_eps,dub_start,f"Серия {ep_label} ({ep_index}/{len(episodes)}): {dub} — получение прямой ссылки…")
                     if not item: errors.append(f"Серия {ep_label}: нет озвучки «{dub}»."); failed=True; break
+                    prefetched=None
+                    if dub in prefetch:
+                        future=prefetch[dub]
+                        if future is not None: prefetched=future.result()
+                        # Keep at most two active audio jobs. The next job is
+                        # queued only after the current result is consumed.
+                        remaining=[name for name in self.dubbings if name not in prefetch
+                                   and name != self.episode_items[ep]["__video__"].dubbing]
+                        if remaining:
+                            name=remaining[0]
+                            if not (self.checkpoint and self.checkpoint.file(f"{ep}:{name}")):
+                                prefetch[name]=self._audio_pool.submit(self.prefetch_audio,ep,name,temp_dir)
+                            else:
+                                prefetch[name]=None
                     cached=self.checkpoint.file(f"{ep}:{dub}") if self.checkpoint else None
+                    if not cached and prefetched and Path(prefetched[0]).is_file():
+                        cached=prefetched
                     if cached:
                         cached_path,item=cached
                         if dub == "__video__": self.episode_items[ep]["__video__"]=item
                         source_files.append((cached_path,dub))
+                        if dub == "__video__" and use_merge and len(self.dubbings)>1:
+                            pending=[name for name in self.dubbings if name != item.dubbing
+                                     and not (self.checkpoint and self.checkpoint.file(f"{ep}:{name}"))]
+                            if pending:
+                                self._audio_pool=ThreadPoolExecutor(max_workers=2,thread_name_prefix="audio")
+                                for name in pending[:2]:
+                                    prefetch[name]=self._audio_pool.submit(self.prefetch_audio,ep,name,temp_dir)
                         self.emit_progress(ep_index,total_eps,dub_start+dub_span,
                                            f"Серия {ep_label}: {dub} — уже скачано")
                         continue
@@ -1382,6 +1509,13 @@ class WorkThread(QThread):
                                     errors.append(f"Серия {ep_label}, {dub}: главы не добавлены: {chapter_error}")
                             if self.checkpoint: self.checkpoint.mark_file(f"{ep}:{dub}",dest,item)
                             source_files.append((dest, dub))
+                            if dub == "__video__" and use_merge and len(self.dubbings)>1:
+                                pending=[name for name in self.dubbings if name != item.dubbing
+                                         and not (self.checkpoint and self.checkpoint.file(f"{ep}:{name}"))]
+                                if pending:
+                                    self._audio_pool=ThreadPoolExecutor(max_workers=2,thread_name_prefix="audio")
+                                    for name in pending[:2]:
+                                        prefetch[name]=self._audio_pool.submit(self.prefetch_audio,ep,name,temp_dir)
                             last_error = None
                             break
 
@@ -1401,6 +1535,9 @@ class WorkThread(QThread):
                         errors.append(f"Серия {ep_label}, {dub}: {last_error}")
                         failed = True
                         break
+                if self._audio_pool is not None:
+                    self._audio_pool.shutdown(wait=True,cancel_futures=failed)
+                    self._audio_pool=None
                 if failed:
                     self.emit_progress(ep_index,total_eps,100,f"Серия {ep_label}: пропущена из-за ошибки."); continue
                 if use_merge:
@@ -1449,6 +1586,10 @@ class WorkThread(QThread):
         except Exception as e:
             LOGGER.exception("Download worker failed")
             self.failed.emit(str(e))
+        finally:
+            if self._audio_pool is not None:
+                self._audio_pool.shutdown(wait=True,cancel_futures=True)
+                self._audio_pool=None
 
 
 class UpdateCheckThread(QThread):
