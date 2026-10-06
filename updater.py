@@ -26,7 +26,7 @@ SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 
 SOURCE_FILES = (
     "main.py", "resolvers.py", "alloha_runtime.py", "hls_download.py", "resilient_download.py", "chapters.py",
-    "diagnostics.py", "url_history.py", "updater.py", "update_source.py",
+    "diagnostics.py", "process_utils.py", "url_history.py", "updater.py", "update_source.py",
     "requirements.txt", "VERSION", "README.md", "CHANGELOG.md",
     "NOTICE.md", "SECURITY.md", "build_exe.bat", "install.bat",
     "install_alloha_resolver.bat", "start_alloha_resolver.bat",

@@ -11,6 +11,7 @@ on:
       - hls_download.py
       - chapters.py
       - diagnostics.py
+      - process_utils.py
       - url_history.py
       - updater.py
       - update_source.py
@@ -20,6 +21,7 @@ on:
       - requirements.txt
       - VERSION
       - build_exe.bat
+      - YummyAnimeManager.spec
       - .github/workflows/build-windows.yml
   workflow_dispatch:
 
@@ -48,7 +50,7 @@ jobs:
           python test_resolvers.py
           python test_plexmatch.py
       - name: Build executable
-        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --collect-all imageio_ffmpeg --name YummyAnimeManager main.py
+        run: python -m PyInstaller --noconfirm --clean YummyAnimeManager.spec
       - name: Build update files
         run: python scripts/build_update_payload.py
       - uses: actions/upload-artifact@v4

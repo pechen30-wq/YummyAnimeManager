@@ -57,6 +57,10 @@ class HistoryGuiTests(unittest.TestCase):
             with patch.object(window, "schedule_quality_probe"):
                 window.on_loaded({"title": "Test"}, raw)
             self.assertEqual(window.player_combo.currentText(), "CVH")
+            self.assertTrue(window.source_options.isHidden())
+            self.assertIn("CVH", window.source_toggle.text())
+            window.source_toggle.click()
+            self.assertFalse(window.source_options.isHidden())
             self.assertNotIn("parad-smerti", window.url_edit.lineEdit().placeholderText())
 
     def test_failed_update_is_reported_once(self):

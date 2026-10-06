@@ -9,6 +9,7 @@ Plex-friendly naming и `.plexmatch`.
 ## Возможности
 
 - URL YummyAnime → список плееров, озвучек и серий;
+- связанные телевизионные сезоны загружаются в список по ссылке на любой сезон;
 - динамическое определение реально доступных качеств;
 - источники: CVH, Kodik, Aksor, Sibnet, Rutube, VK Video, Zedfilm и прямые media URL;
 - Alloha через self-hosted resolver из официального YummyAnime Lampa plugin;
@@ -26,9 +27,9 @@ Plex-friendly naming и `.plexmatch`.
 
 ## Готовая Windows-версия
 
-Готовый файл находится в `dist/YummyAnimeManager.exe`.
+Готовый файл находится в `dist/YummyAnimeManager-4.8.2.exe`.
 
-Это сборка PyInstaller версии 4.6.0. Для объединения озвучек нужен MKVToolNix.
+Это сборка PyInstaller версии 4.8.2. Для объединения озвучек нужен MKVToolNix.
 Настройки хранятся в `%USERPROFILE%\\.yummy_anime_manager` и не входят в репозиторий.
 
 ## Запуск из исходников

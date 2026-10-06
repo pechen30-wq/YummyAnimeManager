@@ -9,6 +9,7 @@ from pathlib import Path
 import requests
 
 from diagnostics import LOGGER
+from process_utils import hidden_subprocess_kwargs
 
 
 ANISKIP_URL = "https://api.aniskip.com/v2/skip-times/{mal_id}/{episode}"
@@ -27,6 +28,7 @@ def inspect_media(ffmpeg, path, subprocess_run=subprocess.run):
     proc = subprocess_run(
         [str(ffmpeg), "-hide_banner", "-i", str(path), "-f", "ffmetadata", "-"],
         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+        **hidden_subprocess_kwargs(),
     )
     if proc.returncode != 0:
         raise RuntimeError(f"Не удалось проверить главы: {proc.stderr[-500:]}")
@@ -137,7 +139,8 @@ def remux_to_mkv(ffmpeg, source, target, *, chapter_source=None, points=None,
                 str(chapter_input), "-c", "copy", str(staged)]
         LOGGER.debug("Remuxing %s to %s with chapter input %s", source, target, chapter_input)
         proc = subprocess_run(cmd, capture_output=True, text=True,
-                              encoding="utf-8", errors="replace")
+                              encoding="utf-8", errors="replace",
+                              **hidden_subprocess_kwargs())
         if proc.returncode != 0:
             raise RuntimeError(f"Не удалось добавить главы в MKV: {proc.stderr[-1000:]}")
         staged.replace(target)

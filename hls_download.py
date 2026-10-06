@@ -189,7 +189,7 @@ def stage_hls(url, cache, headers, progress, refresh=None, audio_only=False, wor
             try:
                 download_file(request_url, cache / names[target], request_headers,
                               lambda pct, detail: report(target, pct, detail),
-                              session=session, attempts=2, cancelled=stopped.is_set,
+                              session=session, attempts=8, cancelled=stopped.is_set,
                               sleep=stopped.wait, control=control)
                 report(target, 100, "Готово")
                 return

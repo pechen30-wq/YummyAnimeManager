@@ -1,7 +1,6 @@
 
 import sys
 import re
-import os
 import json
 import hashlib
 import shutil
@@ -21,6 +20,7 @@ from resilient_download import (download_file, download_ranges, RangeUnsupported
                                 RangeDownloadError, DownloadControl, PauseDownload, StopDownload)
 from hls_download import stage_hls
 from chapters import aniskip_points, inspect_media, remux_to_mkv
+from process_utils import hidden_subprocess_kwargs
 from diagnostics import LOGGER, LOG_DIR, configure_logging, install_exception_hooks, safe_url
 from url_history import remember_url
 
@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "YummyAnime Manager"
-APP_VERSION = "4.6.0"
+APP_VERSION = "4.8.2"
 YUMMY_API_BASE = "https://api.yani.tv"
 CVH_API_BASE = "https://plapi.cdnvideohub.com/api/v1/player/sv"
 
@@ -77,6 +77,7 @@ class VideoItem:
     player_id: int | None = None
     duration: float | None = None
     season_hint: int | None = None
+    views: int = 0
 
     @property
     def episode_key(self):
@@ -188,18 +189,27 @@ class DownloadCheckpoint:
         try:
             settings=self.payload.get("settings",{})
             base=Path(settings.get("base_dir","")).resolve()
-            title=base/safe_name(settings.get("anime_title", ""))
+            grouped=bool(settings.get("plex_structure") and settings.get("series_title"))
+            show_title=settings.get("series_title") if grouped else settings.get("anime_title", "")
+            season=int(settings.get("season_number",1))
+            title=base/safe_name(show_title)
             if title.resolve().parent == base and title.is_dir():
                 staging=title/".tmp"
+                if "series_title" in settings:
+                    staging=staging/f"season_{season:02d}"
                 if staging.resolve().parent == title.resolve() and staging.is_dir():
                     shutil.rmtree(staging)
-                for folder in (title,title/f"Season {int(settings.get('season_number',1)):02d}"):
+                elif (staging.is_dir() and staging.resolve().parent == (title/".tmp").resolve()
+                      and (title/".tmp").resolve().parent == title.resolve()):
+                    shutil.rmtree(staging)
+                for folder in (title,title/f"Season {season:02d}"):
                     if folder.is_dir() and folder.resolve().parent in (title.resolve(),base):
                         for entry in folder.iterdir():
-                            if entry.name.startswith(safe_name(settings.get("anime_title",""))):
+                            prefix=f"{safe_name(show_title)} - S{season:02d}E"
+                            if entry.name.startswith(prefix):
                                 if entry.name.endswith((".part",".part.url",".range.part",".range.part.json")):
                                     entry.unlink(missing_ok=True)
-                            elif entry.name.startswith(".hls_") and entry.is_dir():
+                            elif entry.name.startswith(".hls_"+prefix) and entry.is_dir():
                                 shutil.rmtree(entry)
         finally:
             self.clear()
@@ -279,6 +289,18 @@ def episode_label(value):
         return str(value)
 
 
+def dubbing_stats(items):
+    """Count unique episodes and site views without duplicating player mirrors."""
+    by_dubbing = defaultdict(dict)
+    for item in items:
+        episode_views = by_dubbing[item.dubbing]
+        episode_views[item.episode_key] = max(
+            episode_views.get(item.episode_key, 0), max(0, item.views)
+        )
+    return {dub: (set(episodes), sum(episodes.values()))
+            for dub, episodes in by_dubbing.items()}
+
+
 
 def infer_season_from_title(anime):
     """Best-effort Plex season number for a YummyAnime title."""
@@ -347,6 +369,69 @@ def anime_display_title(anime):
     if isinstance(title, dict):
         title = title.get("ru") or title.get("en") or title.get("jp") or next(iter(title.values()), "Anime")
     return str(title)
+
+
+def catalog_series_identity(anime):
+    """Group TV sequel cards only when the site's order and title agree."""
+    title = anime_display_title(anime)
+    fallback = (title, infer_season_from_title(anime), anime)
+    order = (anime or {}).get("viewing_order") or []
+    if not isinstance(order, list) or not order:
+        return fallback
+    current_id = (anime or {}).get("anime_id")
+    position = next((i for i, entry in enumerate(order)
+                     if isinstance(entry, dict) and entry.get("anime_id") == current_id), None)
+    if position is None:
+        return fallback
+    first, current = order[0], order[position]
+    if not isinstance(first, dict) or not isinstance(current, dict):
+        return fallback
+    if any((entry.get("type") or {}).get("alias") != "tv"
+           for entry in (first, current)):
+        return fallback
+    root_title = anime_display_title(first)
+    season = position + 1
+    if position:
+        suffix = title[len(root_title):].strip(" -:()") if title.casefold().startswith(root_title.casefold()) else ""
+        if not re.fullmatch(rf"(?:(?:season|сезон)\s*)?{season}", suffix, re.I):
+            return fallback
+    root_metadata = dict(anime)
+    root_metadata["title"] = root_title
+    root_metadata["year"] = first.get("year") or anime.get("year")
+    if position:
+        root_metadata["remote_ids"] = {}
+    return root_title, season, root_metadata
+
+
+def linked_tv_seasons(anime):
+    """Return season number and card for verified TV sequels in viewing order."""
+    root_title, current_season, _ = catalog_series_identity(anime)
+    order = (anime or {}).get("viewing_order") or []
+    if not isinstance(order, list) or len(order) < 2:
+        return []
+    current_id = anime.get("anime_id") or anime.get("id")
+    current_entry = next((entry for entry in order if isinstance(entry, dict)
+                          and entry.get("anime_id") == current_id), None)
+    if current_entry is None or (current_entry.get("type") or {}).get("alias") != "tv":
+        return []
+    group_id = (current_entry.get("data") or {}).get("id")
+    if not group_id or root_title != anime_display_title(order[0]):
+        return []
+    seasons = []
+    for number, entry in enumerate(order, 1):
+        if not isinstance(entry, dict) or (entry.get("type") or {}).get("alias") != "tv":
+            continue
+        if (entry.get("data") or {}).get("id") != group_id:
+            continue
+        title = anime_display_title(entry)
+        suffix = title[len(root_title):].strip(" -:()") if title.casefold().startswith(root_title.casefold()) else ""
+        if number == 1 and title.casefold() != root_title.casefold():
+            continue
+        if number > 1 and not re.fullmatch(rf"(?:(?:season|сезон)\s*)?{number}", suffix, re.I):
+            continue
+        if entry.get("anime_id"):
+            seasons.append((number, entry))
+    return seasons if any(entry.get("anime_id") == current_id for _, entry in seasons) else []
 
 
 def plex_compatible_ids(anime):
@@ -695,19 +780,6 @@ def pick_quality(streams, wanted):
 
 
 
-def hidden_subprocess_kwargs():
-    """Prevent ffmpeg/mkvmerge console windows from flashing on Windows."""
-    if os.name != "nt": return {}
-    kwargs = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
-    try:
-        si = subprocess.STARTUPINFO()
-        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        si.wShowWindow = 0
-        kwargs["startupinfo"] = si
-    except Exception: pass
-    return kwargs
-
-
 def _parse_iso_duration(value):
     m = re.match(
         r"^P(?:(?P<d>\d+(?:\.\d+)?)D)?T?"
@@ -838,7 +910,35 @@ class FetchThread(QThread):
             anime_id = anime.get("anime_id") or anime.get("id")
             if anime_id is None:
                 raise RuntimeError("API не вернул anime_id.")
-            self.loaded.emit(anime, api.videos(int(anime_id)))
+            seasons = linked_tv_seasons(anime)
+            if not seasons:
+                self.loaded.emit(anime, api.videos(int(anime_id)))
+                return
+            records, season_anime = [], {}
+            for number, entry in seasons:
+                try:
+                    if entry.get("anime_id") == anime_id:
+                        card = anime
+                    else:
+                        slug = extract_slug(entry.get("anime_url") or "")
+                        card = api.anime(slug) if slug else api.anime(str(entry["anime_id"]))
+                    card_id = card.get("anime_id") or card.get("id")
+                    if card_id != entry.get("anime_id"):
+                        raise RuntimeError("Получена карточка другого сезона")
+                    videos = api.videos(int(card_id))
+                    if not isinstance(videos, list) or not videos:
+                        continue
+                    season_anime[number] = card
+                    for video in videos:
+                        if isinstance(video, dict):
+                            records.append({**video, "_catalog_season": number})
+                except Exception:
+                    if entry.get("anime_id") == anime_id:
+                        raise
+                    LOGGER.exception("Could not load linked season %s", number)
+            anime = dict(anime)
+            anime["_catalog_seasons"] = season_anime
+            self.loaded.emit(anime, records)
         except Exception as e:
             LOGGER.exception("Anime metadata request failed for slug=%s", self.slug)
             self.failed.emit(str(e))
@@ -896,9 +996,10 @@ class WorkThread(QThread):
     def __init__(self,player,dubbings,episode_items,quality,base_dir,anime_title,merge_enabled,
                  mkvmerge_path,keep_sources,season_number=1,plex_structure=True,
                  plexmatch_enabled=True,anime_metadata=None,resolver_config=None,ffmpeg_path="",
-                 chapters_enabled=True,checkpoint=None):
+                 chapters_enabled=True,checkpoint=None,series_title=None):
         super().__init__(); self.player=player; self.dubbings=dubbings; self.episode_items=episode_items
         self.quality=quality; self.base_dir=Path(base_dir); self.anime_title=anime_title
+        self.series_title=series_title or anime_title
         self.merge_enabled=merge_enabled; self.mkvmerge=mkvmerge_path; self.keep_sources=keep_sources
         self.season_number=int(season_number or 1); self.plex_structure=bool(plex_structure)
         self.plexmatch_enabled=bool(plexmatch_enabled); self.anime_metadata=anime_metadata or {}
@@ -1157,9 +1258,15 @@ class WorkThread(QThread):
         try:
             LOGGER.info("Download started: title=%s episodes=%s dubbings=%s quality=%s chapters=%s",
                         self.anime_title,len(self.episode_items),self.dubbings,self.quality,self.chapters_enabled)
-            title_dir=self.base_dir/safe_name(self.anime_title)
+            show_title=self.series_title if self.plex_structure else self.anime_title
+            title_dir=self.base_dir/safe_name(show_title)
             media_dir=title_dir/f"Season {self.season_number:02d}" if self.plex_structure else title_dir
-            if self.plexmatch_enabled: write_plexmatch(title_dir,self.anime_metadata)
+            if self.plexmatch_enabled:
+                metadata = self.anime_metadata
+                if show_title != self.anime_title:
+                    _, _, metadata = catalog_series_identity(metadata)
+                if show_title == self.anime_title or not (title_dir/".plexmatch").exists():
+                    write_plexmatch(title_dir,metadata)
             errors=[]; completed=0; episodes=sorted(self.episode_items); total_eps=max(1,len(episodes))
             cross_source = any(
                 items.get("__video__") is not None and
@@ -1178,7 +1285,11 @@ class WorkThread(QThread):
                     self.emit_progress(ep_index,total_eps,100,f"Серия {episode_label(ep)}: уже скачана.")
                     continue
                 LOGGER.info("Episode %s started",ep)
-                source_files=[]; ep_label=episode_label(ep); temp_dir=title_dir/".tmp"/f"episode_{safe_name(ep_label)}"; failed=False
+                source_files=[]; ep_label=episode_label(ep)
+                staging=title_dir/".tmp"
+                if self.checkpoint and "series_title" in self.checkpoint.payload.get("settings",{}):
+                    staging=staging/f"season_{self.season_number:02d}"
+                temp_dir=staging/f"episode_{safe_name(ep_label)}"; failed=False
                 self.emit_progress(ep_index,total_eps,0,f"Серия {ep_label} ({ep_index}/{len(episodes)}): подготовка…")
                 for dub_index,dub in enumerate(download_dubs,1):
                     item=self.episode_items[ep].get(dub); dub_start=(dub_index-1)*dub_span
@@ -1242,7 +1353,7 @@ class WorkThread(QThread):
                                 except Exception:
                                     plex_ep = f"S{self.season_number:02d}E{safe_name(ep_label)}"
                                 suffix = f" [{safe_name(dub)}]" if len(self.dubbings) > 1 else ""
-                                dest = media_dir / f"{safe_name(self.anime_title)} - {plex_ep}{suffix}{ext}"
+                                dest = media_dir / f"{safe_name(show_title)} - {plex_ep}{suffix}{ext}"
 
                             if attempt > 1 and dest.exists():
                                 try:
@@ -1295,7 +1406,7 @@ class WorkThread(QThread):
                 if use_merge:
                     try: plex_ep=f"S{self.season_number:02d}E{int(float(ep)):02d}"
                     except Exception: plex_ep=f"S{self.season_number:02d}E{safe_name(ep_label)}"
-                    output=media_dir/f"{safe_name(self.anime_title)} - {plex_ep}.mkv"
+                    output=media_dir/f"{safe_name(show_title)} - {plex_ep}.mkv"
                     self.emit_progress(ep_index,total_eps,90,f"Серия {ep_label} ({ep_index}/{len(episodes)}): объединение {len(source_files)} озвучек в MKV…")
                     try:
                         def mp(pct): self.emit_progress(ep_index,total_eps,90+pct*0.10,f"Серия {ep_label} ({ep_index}/{len(episodes)}): MKVToolNix — {pct}%")
@@ -1321,8 +1432,11 @@ class WorkThread(QThread):
                         self.checkpoint.complete_episode(ep,source_files[0][0])
                 self.emit_progress(ep_index,total_eps,100,f"Серия {ep_label} ({ep_index}/{len(episodes)}): готово.")
             if use_merge and not self.keep_sources:
+                if self.checkpoint and "series_title" in self.checkpoint.payload.get("settings",{}):
+                    try: (title_dir/".tmp"/f"season_{self.season_number:02d}").rmdir()
+                    except OSError: pass
                 try: (title_dir/".tmp").rmdir()
-                except Exception: pass
+                except OSError: pass
             self.progress.emit(100,100,"Готово")
             if self.checkpoint and not errors: self.checkpoint.clear()
             self.done.emit(f"Готово. Обработано серий: {completed}. Ошибок/пропусков: {len(errors)}.",errors)
@@ -1488,9 +1602,13 @@ class MainWindow(QMainWindow):
             self.config["alloha_resolver_url"] = "http://127.0.0.1:8790"
 
         self.anime = None
+        self.season_anime = {}
+        self.series_title = None
+        self.series_number = 1
         self.videos = []
         self.player_map = {}
         self.dub_checks = {}
+        self._episodes_initialized = False
         self.fetch_thread = None
         self.work_thread = None
         self.close_after_pause = False
@@ -1530,11 +1648,13 @@ class MainWindow(QMainWindow):
         self.title_label = QLabel("Вставьте ссылку на аниме.")
         self.title_label.setStyleSheet("font-size: 20px; font-weight: 600;")
         layout.addWidget(self.title_label)
+        self.series_label = QLabel("")
+        layout.addWidget(self.series_label)
 
-        # Player + quality
+        # Keep the everyday choice prominent; source overrides are optional.
         selector = QHBoxLayout()
         self.player_combo = QComboBox()
-        self.player_combo.setMinimumWidth(320)
+        self.player_combo.setMinimumWidth(260)
         self.quality_combo = QComboBox()
         self.quality_combo.setMinimumWidth(170)
         self.quality_combo.addItem("Загрузите аниме", None)
@@ -1542,17 +1662,34 @@ class MainWindow(QMainWindow):
         self.season_combo = QComboBox()
         self.season_combo.setMinimumWidth(130)
         self.season_combo.addItem("Сезон 1", 1)
-        selector.addWidget(QLabel("Источник видео:")); selector.addWidget(self.player_combo, 1); selector.addSpacing(20)
-        selector.addWidget(QLabel("Качество:")); selector.addWidget(self.quality_combo); selector.addSpacing(20)
+        selector.addWidget(QLabel("Качество видео:")); selector.addWidget(self.quality_combo); selector.addSpacing(20)
         selector.addWidget(QLabel("Сезон:")); selector.addWidget(self.season_combo)
+        selector.addStretch()
         layout.addLayout(selector)
         self.quality_status = QLabel("")
         self.quality_status.setWordWrap(True)
         layout.addWidget(self.quality_status)
 
+        self.source_toggle = QPushButton("Источник видео · изменить ▸")
+        self.source_toggle.setCheckable(True)
+        self.source_toggle.setFlat(True)
+        self.source_toggle.setEnabled(False)
+        self.source_toggle.setToolTip("Выбор другого плеера, если автоматически выбранный источник недоступен.")
+        source_toggle_row = QHBoxLayout()
+        source_toggle_row.addWidget(self.source_toggle)
+        source_toggle_row.addStretch()
+        layout.addLayout(source_toggle_row)
+        self.source_options = QWidget()
+        source_layout = QVBoxLayout(self.source_options)
+        source_row = QHBoxLayout()
+        source_row.addWidget(QLabel("Источник видео:"))
+        source_row.addWidget(self.player_combo, 1)
+        source_layout.addLayout(source_row)
         self.source_status = QLabel("")
         self.source_status.setWordWrap(True)
-        layout.addWidget(self.source_status)
+        source_layout.addWidget(self.source_status)
+        self.source_options.setVisible(False)
+        layout.addWidget(self.source_options)
 
         self.plex_structure = QCheckBox(
             "Plex-структура: Название аниме / Season XX / Название - SxxEyy.mkv"
@@ -1574,12 +1711,19 @@ class MainWindow(QMainWindow):
         # dubbings
         dub_box = QGroupBox("Озвучки")
         dub_layout = QVBoxLayout(dub_box)
+        dub_buttons = QHBoxLayout()
+        self.dub_all = QPushButton("Выбрать все")
+        self.dub_none = QPushButton("Снять все")
+        dub_buttons.addWidget(self.dub_all)
+        dub_buttons.addWidget(self.dub_none)
+        dub_buttons.addStretch()
+        dub_layout.addLayout(dub_buttons)
         self.dub_list = QListWidget()
         dub_layout.addWidget(self.dub_list)
         splitter.addWidget(dub_box)
 
         # episodes
-        ep_box = QGroupBox("Серии, доступные во всех выбранных озвучках")
+        ep_box = QGroupBox("Серии")
         ep_layout = QVBoxLayout(ep_box)
         ep_buttons = QHBoxLayout()
         self.ep_all = QPushButton("Выбрать все")
@@ -1653,8 +1797,12 @@ class MainWindow(QMainWindow):
         self.load_btn.clicked.connect(self.load_anime)
         self.settings_btn.clicked.connect(self.show_settings)
         self.player_combo.currentTextChanged.connect(self.on_player_changed)
+        self.source_toggle.toggled.connect(self.on_source_toggle)
         self.season_combo.currentIndexChanged.connect(self.on_season_changed)
-        self.dub_list.itemChanged.connect(self.rebuild_episodes)
+        self.dub_list.itemChanged.connect(self.update_selection_state)
+        self.ep_list.itemChanged.connect(self.on_episode_selection_changed)
+        self.dub_all.clicked.connect(lambda: self.set_dubbing_checks(Qt.Checked))
+        self.dub_none.clicked.connect(lambda: self.set_dubbing_checks(Qt.Unchecked))
         self.ep_all.clicked.connect(lambda: self.set_episode_checks(Qt.Checked))
         self.ep_none.clicked.connect(lambda: self.set_episode_checks(Qt.Unchecked))
         self.folder_btn.clicked.connect(self.choose_folder)
@@ -1726,24 +1874,63 @@ class MainWindow(QMainWindow):
         try: return int(self.season_combo.currentData())
         except Exception: return infer_season_from_title(self.anime)
     def available_seasons_for_player(self):
+        if self.season_anime:
+            return sorted(self.season_anime)
+        if self.series_title and self.series_title != anime_display_title(self.anime):
+            return [self.series_number]
         items=self.videos
         explicit=sorted({int(v.season_hint) for v in items if v.season_hint is not None})
-        return explicit or [infer_season_from_title(self.anime)]
+        return explicit or [self.series_number]
     def rebuild_seasons(self):
         prev=self.current_season() if self.season_combo.count() else None; seasons=self.available_seasons_for_player()
         self.season_combo.blockSignals(True); self.season_combo.clear()
         for s in seasons: self.season_combo.addItem("Спецвыпуски" if s==0 else f"Сезон {s}",s)
         if prev in seasons: self.season_combo.setCurrentIndex(seasons.index(prev))
+        elif self.series_number in seasons: self.season_combo.setCurrentIndex(seasons.index(self.series_number))
         elif seasons: self.season_combo.setCurrentIndex(0)
         self.season_combo.blockSignals(False)
     def player_items_for_current_season(self):
         items=list(self.player_map.get(self.player_combo.currentText(),[])); explicit=[x for x in items if x.season_hint is not None]
+        if self.season_anime:
+            return [x for x in items if x.season_hint == self.current_season()]
+        if self.series_title and self.series_title != anime_display_title(self.anime):
+            return items
         return [x for x in items if x.season_hint==self.current_season()] if explicit else items
     def all_items_for_current_season(self):
+        if self.season_anime:
+            return [v for v in self.videos if v.season_hint == self.current_season()]
+        if self.series_title and self.series_title != anime_display_title(self.anime):
+            return list(self.videos)
         return [v for v in self.videos if v.season_hint is None or v.season_hint == self.current_season()]
     def on_player_changed(self):
-        self.update_source_status(); self.refresh_dubbing_sources(); self.rebuild_episodes()
-    def on_season_changed(self): self.rebuild_dubbings()
+        self.update_source_toggle()
+        self.rebuild_episodes()
+        self.rebuild_dubbings()
+    def on_source_toggle(self, expanded):
+        self.source_options.setVisible(expanded)
+        self.update_source_toggle()
+    def update_source_toggle(self):
+        source = self.player_combo.currentText()
+        arrow = "▾" if self.source_toggle.isChecked() else "▸"
+        self.source_toggle.setText(
+            f"Источник видео: {source} · изменить {arrow}" if source
+            else f"Источник видео · изменить {arrow}")
+    def on_season_changed(self):
+        self._episodes_initialized = False
+        self.update_season_header()
+        self.rebuild_dubbings()
+    def current_anime_metadata(self):
+        return self.season_anime.get(self.current_season(), self.anime)
+    def update_season_header(self):
+        metadata = self.current_anime_metadata()
+        self.title_label.setText(anime_display_title(metadata))
+        if self.season_anime:
+            self.series_label.setText(
+                f"{self.series_title} · сезон {self.current_season()} из {len(self.season_anime)} доступных")
+        elif self.anime and len(self.anime.get("viewing_order") or []) > 1:
+            self.series_label.setText(f"Для Plex: {self.series_title} / Season {self.current_season():02d}")
+        else:
+            self.series_label.setText("")
     def schedule_quality_probe(self):
         self.quality_probe_serial += 1
         self.quality_probe_timer.start()
@@ -1751,7 +1938,9 @@ class MainWindow(QMainWindow):
         if self.quality_threads:
             self.quality_probe_timer.start()
             return
-        selected=self.selected_dubbings(); matrix=self.episode_matrix(); common=[ep for ep,dubs in matrix.items() if all(d in dubs for d in selected)]
+        selected=self.selected_dubbings(); matrix=self.episode_matrix()
+        common=[ep for ep in self.selected_episodes()
+                if ep in matrix and all(d in matrix[ep] for d in selected)]
         serial=self.quality_probe_serial
         self.quality_combo.clear(); self.quality_combo.addItem("Проверяю…",None); self.quality_combo.setEnabled(False)
         self.quality_status.setText("Проверяю реальные качества выбранного источника…")
@@ -1842,7 +2031,10 @@ class MainWindow(QMainWindow):
 
         self.load_btn.setEnabled(False)
         self.title_label.setText("Загрузка…")
+        self.series_label.setText("")
         self.player_combo.clear(); self.dub_list.clear(); self.ep_list.clear(); self.season_combo.clear()
+        self.source_toggle.setEnabled(False)
+        self.update_source_toggle()
         self.quality_combo.clear(); self.quality_combo.addItem("Загрузка…",None); self.quality_combo.setEnabled(False); self.quality_status.setText("")
         self.statusBar().showMessage("Запрос YummyAnime API…")
 
@@ -1864,14 +2056,13 @@ class MainWindow(QMainWindow):
     def on_loaded(self, anime, raw):
         self.load_btn.setEnabled(True)
         self.anime = anime
+        self.series_title, self.series_number, _ = catalog_series_identity(anime)
+        self.season_anime = {int(number): card for number, card in
+                             (anime.get("_catalog_seasons") or {}).items()}
         LOGGER.info("Anime loaded: video_records=%s",len(raw) if isinstance(raw,list) else 0)
 
-        title = anime.get("title") or anime.get("name") or "Без названия"
-        if isinstance(title, dict):
-            title = title.get("ru") or title.get("en") or next(iter(title.values()), "Без названия")
-        self.title_label.setText(str(title))
-
         self.videos = []
+        self._episodes_initialized = False
         for v in raw if isinstance(raw, list) else []:
             data = v.get("data") or {}
             self.videos.append(VideoItem(
@@ -1883,7 +2074,8 @@ class MainWindow(QMainWindow):
                 iframe_url=str(v.get("iframe_url") or ""),
                 player_id=data.get("player_id"),
                 duration=v.get("duration"),
-                season_hint=video_season_hint(v, v.get("iframe_url"), anime),
+                season_hint=v.get("_catalog_season") or video_season_hint(v, v.get("iframe_url"), anime),
+                views=max(0, int(v.get("views") or 0)),
             ))
 
         self.player_map = defaultdict(list)
@@ -1898,33 +2090,48 @@ class MainWindow(QMainWindow):
         if cvh_index >= 0:
             self.player_combo.setCurrentIndex(cvh_index)
         self.player_combo.blockSignals(False)
+        self.source_toggle.setEnabled(bool(self.player_combo.count()))
+        self.update_source_toggle()
 
+        self.season_combo.blockSignals(True)
+        self.season_combo.clear()
         self.rebuild_seasons()
+        self.update_season_header()
         self.rebuild_dubbings()
         self.statusBar().showMessage(
-            f"Найдено {len(self.player_map)} плееров, {len(self.videos)} записей видео."
+            f"Найдено сезонов: {len(self.season_anime) or 1}; "
+            f"плееров: {len(self.player_map)}; записей видео: {len(self.videos)}."
         )
 
     def rebuild_dubbings(self):
         self.update_source_status()
+        previous = set(self.selected_dubbings())
+        had_rows = self.dub_list.count() > 0
+        chosen_episodes = set(self.selected_episodes()) if self._episodes_initialized else set()
+        stats = dubbing_stats(self.all_items_for_current_season())
+        dubbings = sorted(
+            (dub for dub, (episodes, _) in stats.items()
+             if chosen_episodes <= episodes),
+            key=lambda dub: (-stats[dub][1], dub.casefold()),
+        )
+        checked = previous & set(dubbings)
+        if not checked and (previous or not had_rows) and dubbings:
+            checked = {dubbings[0]}
         self.dub_list.blockSignals(True)
         self.dub_list.clear()
-
-        dubbings = sorted({v.dubbing for v in self.all_items_for_current_season()}, key=str.casefold)
-
-        for i, dub in enumerate(dubbings):
+        for dub in dubbings:
             item = QListWidgetItem(dub)
             item.setData(Qt.UserRole, dub)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Checked if i == 0 else Qt.Unchecked)
+            item.setCheckState(Qt.Checked if dub in checked else Qt.Unchecked)
             self.dub_list.addItem(item)
-
         self.dub_list.blockSignals(False)
         self.refresh_dubbing_sources()
         self.rebuild_episodes()
 
     def refresh_dubbing_sources(self):
         items = self.all_items_for_current_season()
+        stats = dubbing_stats(items)
         player = self.player_combo.currentText()
         self.dub_list.blockSignals(True)
         try:
@@ -1932,7 +2139,8 @@ class MainWindow(QMainWindow):
                 row = self.dub_list.item(index)
                 dub = row.data(Qt.UserRole)
                 sources = sorted({provider_label(v) for v in items if v.dubbing == dub},key=str.casefold)
-                row.setText(f"{dub}\nПлееры: {', '.join(sources)}")
+                episodes, views = stats[dub]
+                row.setText(f"{dub} · серий: {len(episodes)} · просмотров: {views:,}\nПлееры: {', '.join(sources)}")
                 available = any(v.dubbing == dub and v.player == player for v in items)
                 row.setToolTip("Источники: " + ", ".join(sources) +
                                (". Доступна в выбранном плеере; если выбрана для видео, её звук используется без повторной загрузки."
@@ -1980,48 +2188,66 @@ class MainWindow(QMainWindow):
         return {ep: dubs for ep, dubs in matrix.items() if "__video__" in dubs}
 
     def rebuild_episodes(self):
+        was_initialized = self._episodes_initialized
         self.ep_list.blockSignals(True)
-        previous = {
-            self.ep_list.item(i).data(Qt.UserRole)
-            for i in range(self.ep_list.count())
-            if self.ep_list.item(i).checkState() == Qt.Checked
-        }
+        previous = set(self.selected_episodes()) if self._episodes_initialized else set()
         self.ep_list.clear()
-
         selected = self.selected_dubbings()
-        if not selected:
-            self.ep_list.blockSignals(False); self.merge_check.setEnabled(False); self.quality_probe_serial += 1
-            self.quality_combo.clear(); self.quality_combo.addItem("Выберите озвучку",None); self.quality_combo.setEnabled(False); self.quality_status.setText("")
-            return
-
-        matrix = self.episode_matrix()
-        common = [
-            ep for ep, dubs in matrix.items()
-            if all(d in dubs for d in selected)
-        ]
-
-        for ep in sorted(common):
+        available = {item.episode_key for item in self.player_items_for_current_season()}
+        if not self._episodes_initialized and selected:
+            stats = dubbing_stats(self.all_items_for_current_season())
+            previous = available & stats[selected[0]][0]
+        for ep in sorted(available):
             item = QListWidgetItem(f"Серия {episode_label(ep)}")
             item.setData(Qt.UserRole, ep)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Checked if not previous or ep in previous else Qt.Unchecked)
+            item.setCheckState(Qt.Checked if ep in previous else Qt.Unchecked)
             self.ep_list.addItem(item)
-
         self.ep_list.blockSignals(False)
+        self._episodes_initialized = True
+        if not was_initialized:
+            self.rebuild_dubbings()
+            return
+        self.update_selection_state()
+
+    def on_episode_selection_changed(self, _item):
+        self.rebuild_dubbings()
+
+    def update_selection_state(self, _item=None):
+        selected = self.selected_dubbings()
+        episodes = self.selected_episodes()
+        matrix = self.episode_matrix() if selected else {}
+        ready = [ep for ep in episodes if ep in matrix and all(d in matrix[ep] for d in selected)]
         requires_mux = any(
             any(matrix[ep][dub] != matrix[ep]["__video__"] for dub in selected)
-            for ep in common)
+            for ep in ready)
         self.merge_check.setEnabled(len(selected) > 1 and not requires_mux)
         self.merge_check.setChecked(requires_mux or len(selected) > 1)
-
         self.statusBar().showMessage(
-            f"Выбрано озвучек: {len(selected)} · общих серий: {len(common)}"
+            f"Выбрано озвучек: {len(selected)} · серий: {len(ready)}"
         )
+        if not selected or not ready:
+            self.quality_probe_serial += 1
+            self.quality_combo.clear()
+            self.quality_combo.addItem("Выберите озвучку и серии", None)
+            self.quality_combo.setEnabled(False)
+            self.quality_status.setText("")
+            return
         self.schedule_quality_probe()
 
     def set_episode_checks(self, state):
+        self.ep_list.blockSignals(True)
         for i in range(self.ep_list.count()):
             self.ep_list.item(i).setCheckState(state)
+        self.ep_list.blockSignals(False)
+        self.on_episode_selection_changed(None)
+
+    def set_dubbing_checks(self, state):
+        self.dub_list.blockSignals(True)
+        for i in range(self.dub_list.count()):
+            self.dub_list.item(i).setCheckState(state)
+        self.dub_list.blockSignals(False)
+        self.update_selection_state()
 
     def selected_episodes(self):
         return [
@@ -2031,7 +2257,7 @@ class MainWindow(QMainWindow):
         ]
 
     def anime_title(self):
-        return anime_display_title(self.anime)
+        return anime_display_title(self.current_anime_metadata())
 
     def start_download(self):
         if self.checkpoint:
@@ -2053,6 +2279,12 @@ class MainWindow(QMainWindow):
 
         matrix = self.episode_matrix()
         selected_matrix = {ep: matrix[ep] for ep in episodes if ep in matrix}
+        if len(selected_matrix) != len(episodes) or any(
+                any(dub not in items for dub in dubbings)
+                for items in selected_matrix.values()):
+            QMessageBox.warning(self, APP_NAME,
+                "Не все выбранные озвучки доступны для отмеченных серий. Обновите выбор.")
+            return
 
         do_merge = self.merge_check.isChecked() and len(dubbings) > 1
         do_merge = do_merge or any(
@@ -2077,6 +2309,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self,APP_NAME,"Дождитесь определения доступных качеств или выберите доступное качество."); return
         self.series_progress.setValue(0); self.overall_progress.setValue(0)
         self.current_status_label.setText("Подготовка загрузки…")
+        self.statusBar().clearMessage()
         LOGGER.info("Selection: player=%s dubbings=%s episodes=%s quality=%s merge=%s",
                     player,dubbings,episodes,quality_value,do_merge)
 
@@ -2086,13 +2319,14 @@ class MainWindow(QMainWindow):
             quality=quality_value,
             base_dir=self.folder_edit.text(),
             anime_title=self.anime_title(),
+            series_title=self.series_title or self.anime_title(),
             merge_enabled=do_merge,
             mkvmerge_path=self.config.get("mkvmerge_path", ""),
             keep_sources=self.keep_sources.isChecked(),
             season_number=self.current_season(),
             plex_structure=self.plex_structure.isChecked(),
             plexmatch_enabled=self.plexmatch_check.isChecked(),
-            anime_metadata=self.anime,
+            anime_metadata=self.current_anime_metadata(),
             ffmpeg_path=self.config.get("ffmpeg_path", "") or find_ffmpeg(),
             chapters_enabled=self.chapters_check.isChecked(),
         )
@@ -2188,26 +2422,29 @@ class MainWindow(QMainWindow):
 
     def on_progress(self, series_value, overall_value, text):
         self.series_progress.setValue(series_value); self.overall_progress.setValue(overall_value)
-        self.current_status_label.setText(text); self.statusBar().showMessage(text)
+        self.current_status_label.setText(text)
 
     def on_done(self, summary, errors):
         LOGGER.info("Download finished: %s errors=%s",summary,len(errors))
         if not errors: self.checkpoint=None
         self.set_download_buttons()
         self.series_progress.setValue(100); self.overall_progress.setValue(100)
-        self.current_status_label.setText(summary)
+        self.current_status_label.setText(
+            summary + (" Нажмите «Продолжить», чтобы повторить пропущенные серии." if errors else ""))
         detail = ""
         if errors:
             detail = "\n\n" + "\n".join(errors[:12])
             if len(errors) > 12:
                 detail += f"\n…и ещё {len(errors) - 12}"
+            detail += "\n\nНажмите «Продолжить», чтобы повторить пропущенные серии."
         QMessageBox.information(self, APP_NAME, summary + detail)
 
     def on_work_failed(self, error):
         LOGGER.error("Download failed: %s",error)
         self.set_download_buttons()
-        self.current_status_label.setText(f"Ошибка: {error}")
-        QMessageBox.critical(self, APP_NAME, error)
+        self.current_status_label.setText(f"Ошибка: {error}. Нажмите «Продолжить», чтобы повторить загрузку.")
+        QMessageBox.critical(self, APP_NAME,
+            error + "\n\nЗагрузка сохранена. Нажмите «Продолжить», чтобы повторить пропущенные серии.")
 
 
 if __name__ == "__main__":
