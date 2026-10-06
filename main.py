@@ -994,7 +994,7 @@ def source_attempt_order(candidates):
             for item, limit in zip(candidates, limits) if round_index < limit]
 
 
-def matching_audio_variant(qualities, headers, ffmpeg):
+def matching_audio_variant(qualities, headers, ffmpeg, control=None):
     """Use a smaller Kodik variant only when sampled audio packets are identical."""
     numeric = sorted((int(match.group(1)), url, label)
                      for label, url in qualities.items()
@@ -1003,8 +1003,15 @@ def matching_audio_variant(qualities, headers, ffmpeg):
     if len(numeric) < 2 or not ffmpeg:
         return None
     low, high = numeric[0], numeric[-1]
+    deadline=time.monotonic()+30
+
+    def check():
+        if control: control.check()
+        if time.monotonic()>deadline:
+            raise TimeoutError("audio comparison time budget exceeded")
 
     def segments(entry):
+        check()
         body, base = media_playlist(entry[1], headers)
         if any(tag in body for tag in ("#EXT-X-KEY:", "#EXT-X-BYTERANGE:", "#EXT-X-MAP:")):
             return None
@@ -1015,10 +1022,12 @@ def matching_audio_variant(qualities, headers, ffmpeg):
         return (urls,durations) if len(urls)==len(durations) else None
 
     def audio_hash(url):
+        check()
         with requests.get(url, headers=headers, stream=True, timeout=(10, 25)) as response:
             response.raise_for_status()
             data = bytearray()
             for chunk in response.iter_content(65536):
+                check()
                 data.extend(chunk)
                 if len(data) > 8 * 1024 * 1024:
                     return None
@@ -1090,7 +1099,8 @@ class WorkThread(QThread):
             if master and urllib.parse.urlparse(master).path.lower().endswith(".m3u8"):
                 url = master
             if result.source == "kodik" and url == result.url:
-                equivalent=matching_audio_variant(result.qualities or {}, result.headers or {}, self.ffmpeg)
+                equivalent=matching_audio_variant(result.qualities or {}, result.headers or {},
+                                                  self.ffmpeg,self.control)
                 if equivalent:
                     label,url=equivalent
             result.audio_only = True

@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from main import DownloadCheckpoint, VideoItem, WorkThread, matching_audio_variant
 from resolvers import StreamResult
+from resilient_download import DownloadControl, PauseDownload
 
 
 class AudioOptimizationTests(unittest.TestCase):
@@ -40,6 +41,11 @@ class AudioOptimizationTests(unittest.TestCase):
              patch("main.subprocess.run", side_effect=lambda _args, **kw:
                    SimpleNamespace(returncode=0,stdout=kw["input"])):
             self.assertIsNone(matching_audio_variant(qualities,{},"ffmpeg"))
+
+        control=DownloadControl()
+        control.request("paused")
+        with self.assertRaises(PauseDownload):
+            matching_audio_variant(qualities,{},"ffmpeg",control)
 
     def test_two_tracks_prefetch_and_reuse_without_checkpoint(self):
         video=VideoItem(1,"CVH","Video","1",1,"")
