@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import time
 import threading
+import contextlib
 import random
 import urllib.parse
 from pathlib import Path
@@ -42,7 +43,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "YummyAnime Manager"
-APP_VERSION = "4.8.4"
+APP_VERSION = "4.8.5"
 YUMMY_API_BASE = "https://api.yani.tv"
 CVH_API_BASE = "https://plapi.cdnvideohub.com/api/v1/player/sv"
 
@@ -986,8 +987,89 @@ class QualityProbeThread(QThread):
         self.done.emit(self.serial,qualities,note)
 
 
-def source_attempt_order(candidates):
+class SourceHealth:
+    """Task-local source timings and a short circuit breaker for bad providers."""
+    BASELINE = {"direct":45, "cvh":65, "sibnet":80, "alloha":180,
+                "kodik":240, "aksor":270, "rutube":300, "vk":300}
+
+    def __init__(self):
+        self.lock=threading.Lock()
+        self.stats={}
+
+    @staticmethod
+    def key(item):
+        return provider_kind(item), urllib.parse.urlsplit(getattr(item,"iframe_url","")).hostname or ""
+
+    def sort(self, candidates):
+        now=time.monotonic()
+        with self.lock:
+            def score(item):
+                provider=provider_kind(item)
+                stat=self.stats.get(self.key(item),{})
+                estimate=stat.get("seconds",self.BASELINE.get(provider,360))
+                return (stat.get("cooldown",0)>now,
+                        estimate+120*stat.get("failures",0),stat.get("failures",0))
+            return sorted(candidates,key=score)
+
+    def succeeded(self,item,elapsed,size):
+        with self.lock:
+            stat=self.stats.setdefault(self.key(item),{})
+            stat["seconds"]=(stat.get("seconds",elapsed)+elapsed)/2
+            stat["failures"]=0
+            stat["cooldown"]=0
+        LOGGER.info("Audio source completed: provider=%s seconds=%.2f output_bytes=%s",
+                    provider_kind(item),elapsed,size)
+
+    def failed(self,item,error):
+        with self.lock:
+            stat=self.stats.setdefault(self.key(item),{})
+            stat["failures"]=stat.get("failures",0)+1
+            if stat["failures"]>=2:
+                stat["cooldown"]=time.monotonic()+min(300,30*2**(stat["failures"]-2))
+        LOGGER.warning("Audio source failed: provider=%s failures=%s error=%s",
+                       provider_kind(item),stat["failures"],error)
+
+
+class AdaptiveAudioPolicy:
+    """Trial a third track only if measured throughput improves without errors."""
+    def __init__(self):
+        self.lock=threading.Lock()
+        self.limit=2
+        self.phase="baseline"
+        self.baseline=0
+        self.samples=[]
+        self.errors=0
+
+    def observe(self,seconds,size,failed=False):
+        with self.lock:
+            if failed:
+                self.errors+=1
+            elif seconds>0 and size>0:
+                self.samples.append(size/seconds)
+            if self.phase=="baseline" and len(self.samples)+self.errors>=4:
+                if self.errors:
+                    self.phase="stable"
+                    LOGGER.info("Audio parallelism remains at 2 tracks after source errors")
+                else:
+                    self.baseline=sum(self.samples)/len(self.samples)
+                    self.samples=[]
+                    self.limit=3
+                    self.phase="trial"
+                    LOGGER.info("Audio parallelism trial: 3 tracks")
+                self.errors=0
+            elif self.phase=="trial" and len(self.samples)+self.errors>=4:
+                throughput=sum(self.samples)/len(self.samples) if self.samples else 0
+                if self.errors or throughput*3<self.baseline*2*1.1:
+                    self.limit=2
+                self.phase="stable"
+                LOGGER.info("Audio parallelism chosen: %s tracks baseline=%.0f trial=%.0f errors=%s",
+                            self.limit,self.baseline,throughput,self.errors)
+
+
+def source_attempt_order(candidates, health=None, audio_only=False):
     """Try other sources of the same voice before repeating a failing CDN."""
+    if health is not None and audio_only:
+        candidates=health.sort(candidates)
     limits = [3 if provider_kind(item) == "alloha" else
               1 if provider_kind(item) == "aksor" else 2 for item in candidates]
     return [item for round_index in range(max(limits, default=0))
@@ -1003,7 +1085,7 @@ def matching_audio_variant(qualities, headers, ffmpeg, control=None):
     if len(numeric) < 2 or not ffmpeg:
         return None
     low, high = numeric[0], numeric[-1]
-    deadline=time.monotonic()+30
+    deadline=time.monotonic()+45
 
     def check():
         if control: control.check()
@@ -1012,7 +1094,8 @@ def matching_audio_variant(qualities, headers, ffmpeg, control=None):
 
     def segments(entry):
         check()
-        body, base = media_playlist(entry[1], headers)
+        with (control.transfer(entry[1]) if control else contextlib.nullcontext()):
+            body, base = media_playlist(entry[1], headers)
         if any(tag in body for tag in ("#EXT-X-KEY:", "#EXT-X-BYTERANGE:", "#EXT-X-MAP:")):
             return None
         urls=[urllib.parse.urljoin(base, line.strip()) for line in body.splitlines()
@@ -1023,28 +1106,36 @@ def matching_audio_variant(qualities, headers, ffmpeg, control=None):
 
     def audio_hash(url):
         check()
-        with requests.get(url, headers=headers, stream=True, timeout=(10, 25)) as response:
+        with (control.transfer(url) if control else contextlib.nullcontext()), requests.get(
+                url, headers=headers, stream=True, timeout=(10, 25)) as response:
             response.raise_for_status()
             data = bytearray()
             for chunk in response.iter_content(65536):
                 check()
                 data.extend(chunk)
+                if control: control.record_bytes(len(chunk))
                 if len(data) > 8 * 1024 * 1024:
                     return None
         proc = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
-                               "-map", "0:a:0", "-c:a", "copy", "-f", "hash", "-hash",
+                               "-map", "0:a:0", "-c:a", "copy", "-f", "framehash", "-hash",
                                "sha256", "pipe:1"], input=bytes(data), capture_output=True,
                               timeout=15, **hidden_subprocess_kwargs())
         return proc.stdout.strip() if proc.returncode == 0 else None
 
     try:
-        small, large = segments(low), segments(high)
-        if not small or not large or len(small[0]) != len(large[0]) or small[1] != large[1]:
-            return None
-        for index in sorted({0, len(small[0]) // 2, len(small[0]) - 1}):
-            smaller, larger = audio_hash(small[0][index]), audio_hash(large[0][index])
-            if not smaller or smaller != larger:
+        with ThreadPoolExecutor(max_workers=4,thread_name_prefix="audio-probe") as pool:
+            low_future=pool.submit(segments,low)
+            high_future=pool.submit(segments,high)
+            small,large=low_future.result(),high_future.result()
+            if not small or not large or len(small[0]) != len(large[0]) or small[1] != large[1]:
                 return None
+            indexes=sorted({0,len(small[0])-1})
+            pairs=[(pool.submit(audio_hash,small[0][index]),
+                    pool.submit(audio_hash,large[0][index])) for index in indexes]
+            for low_hash,high_hash in pairs:
+                smaller,larger=low_hash.result(),high_hash.result()
+                if not smaller or smaller!=larger:
+                    return None
         LOGGER.info("Equivalent Kodik audio verified at %s and %s; choosing %s",
                     high[2], low[2], low[2])
         return low[2], low[1]
@@ -1077,6 +1168,15 @@ class WorkThread(QThread):
         self._progress_episode=None
         self._progress_peak=0
         self._audio_pool=None
+        self.source_health=SourceHealth()
+        self.audio_policy=AdaptiveAudioPolicy()
+        self._audio_variant_cache={}
+        self._variant_lock=threading.Lock()
+        self._shared_audio_lock=threading.Lock()
+        self._shared_audio={}
+        self._video_resource=None
+        self._active_tracks=set()
+        self._tracks_lock=threading.Lock()
         self.checkpoint=checkpoint
         self.control=DownloadControl()
     def emit_progress(self,ep_index,total_eps,series_pct,status):
@@ -1089,7 +1189,22 @@ class WorkThread(QThread):
             self._progress_peak=max(self._progress_peak,series_pct)
             series_pct=self._progress_peak
         overall=int((((ep_index-1)+series_pct/100.0)/max(1,total_eps))*100)
+        connections,speed,_=self.control.transfer_stats()
+        with self._tracks_lock:
+            tracks=len(self._active_tracks)
+        if tracks or connections:
+            status+=f" · дорожек: {tracks} · соединений: {connections} · {speed/1048576:.1f} МБ/с"
         self.progress.emit(series_pct,max(0,min(100,overall)),status)
+
+    @contextlib.contextmanager
+    def active_audio(self,dub):
+        with self._tracks_lock:
+            self._active_tracks.add(dub)
+        try:
+            yield
+        finally:
+            with self._tracks_lock:
+                self._active_tracks.discard(dub)
     def resolve_stream(self,item, audio_only=False):
         resolver=getattr(self._resolver_local,"resolver",self.resolver)
         result=resolver.resolve(item); label,url=choose_stream(result,"Лучшее" if audio_only else self.quality)
@@ -1099,8 +1214,16 @@ class WorkThread(QThread):
             if master and urllib.parse.urlparse(master).path.lower().endswith(".m3u8"):
                 url = master
             if result.source == "kodik" and url == result.url:
-                equivalent=matching_audio_variant(result.qualities or {}, result.headers or {},
-                                                  self.ffmpeg,self.control)
+                key=(tuple(sorted((result.qualities or {}).items())),
+                     tuple(sorted((result.headers or {}).items())))
+                with self._variant_lock:
+                    known=key in self._audio_variant_cache
+                    equivalent=self._audio_variant_cache.get(key)
+                if not known:
+                    equivalent=matching_audio_variant(result.qualities or {}, result.headers or {},
+                                                      self.ffmpeg,self.control)
+                    with self._variant_lock:
+                        self._audio_variant_cache[key]=equivalent
                 if equivalent:
                     label,url=equivalent
             result.audio_only = True
@@ -1184,7 +1307,7 @@ class WorkThread(QThread):
             headers={"User-Agent":CHROME_UA}; headers.update(result.headers or {})
             def refresh():
                 PlayerResolver.release(result)
-                fresh=self.resolver.resolve(item)
+                fresh=getattr(self._resolver_local,"resolver",self.resolver).resolve(item)
                 label,url=choose_stream(fresh,result.quality)
                 if result.audio_only:
                     master=(fresh.qualities or {}).get("auto") or fresh.url
@@ -1342,30 +1465,79 @@ class WorkThread(QThread):
         """Prepare one additional track while the preceding track is processed."""
         resolver=PlayerResolver(self.resolver_config)
         self._resolver_local.resolver=resolver
-        stream=None
         try:
             self.control.check()
-            item=self.episode_items[ep].get("__audio_candidates__",{}).get(dub,[self.episode_items[ep][dub]])[0]
-            stream=self.resolve_stream(item,audio_only=True)
-            qtag=safe_name(stream.quality or "auto")
-            dest=temp_dir/f"{safe_name(dub)} [{qtag}]{self.extension_for(stream)}"
-            temp_dir.mkdir(parents=True,exist_ok=True)
-            self.download_stream(stream,dest,item,lambda *_: None)
-            self.control.check()
-            if self.checkpoint: self.checkpoint.mark_file(f"{ep}:{dub}",dest,item)
-            LOGGER.info("Audio prefetched: episode=%s dubbing=%s provider=%s",
-                        ep,dub,stream.source)
-            return dest,item
+            candidates=self.episode_items[ep].get("__audio_candidates__",{}).get(dub,[self.episode_items[ep][dub]])
+            for item in self.source_health.sort(candidates):
+                stream=None
+                started=time.monotonic()
+                try:
+                    stream=self.resolve_stream(item,audio_only=True)
+                    qtag=safe_name(stream.quality or "auto")
+                    dest=temp_dir/f"{safe_name(dub)} [{qtag}]{self.extension_for(stream)}"
+                    temp_dir.mkdir(parents=True,exist_ok=True)
+                    with self.active_audio(dub):
+                        dest=self.download_audio_shared(stream,dest,item,lambda *_: None)
+                    self.control.check()
+                    if self.checkpoint: self.checkpoint.mark_file(f"{ep}:{dub}",dest,item)
+                    self.source_health.succeeded(item,time.monotonic()-started,dest.stat().st_size)
+                    self.audio_policy.observe(time.monotonic()-started,dest.stat().st_size)
+                    LOGGER.info("Audio prefetched: episode=%s dubbing=%s provider=%s",
+                                ep,dub,stream.source)
+                    return dest,item
+                except (PauseDownload,StopDownload):
+                    raise
+                except Exception as error:
+                    self.source_health.failed(item,error)
+                    self.audio_policy.observe(0,0,failed=True)
+                    LOGGER.warning("Audio prefetch attempt failed: episode=%s dubbing=%s provider=%s error=%s",
+                                   ep,dub,provider_kind(item),error)
+                finally:
+                    if stream is not None: PlayerResolver.release(stream)
+            return False
         except (PauseDownload,StopDownload):
             raise
         except Exception as error:
-            LOGGER.warning("Audio prefetch failed: episode=%s dubbing=%s error=%s",
-                           ep,dub,error)
+            LOGGER.warning("Audio prefetch failed: episode=%s dubbing=%s error=%s",ep,dub,error)
             return False
         finally:
-            if stream is not None: PlayerResolver.release(stream)
             resolver.session.close()
             del self._resolver_local.resolver
+
+    def download_audio_shared(self, stream, dest, item, progress_cb):
+        """One writer for an identical resolved URL and request context."""
+        resource=(stream.url,tuple(sorted((stream.headers or {}).items())))
+        if (not stream.is_manifest and self._video_resource
+                and getattr(item,"video_id",None)==self._video_resource[3]
+                and resource==self._video_resource[:2]):
+            video_path=Path(self._video_resource[2])
+            if video_path.is_file():
+                LOGGER.info("Audio resource reused from downloaded video: provider=%s",stream.source)
+                return video_path
+        fingerprint=(stream.url,tuple(sorted((stream.headers or {}).items())),stream.quality)
+        with self._shared_audio_lock:
+            state=self._shared_audio.get(fingerprint)
+            owner=state is None
+            if owner:
+                state={"event":threading.Event(),"path":None}
+                self._shared_audio[fingerprint]=state
+        if not owner:
+            while not state["event"].wait(0.2):
+                self.control.check()
+            self.control.check()
+            if state["path"] and Path(state["path"]).is_file():
+                LOGGER.info("Identical audio resource reused: provider=%s",stream.source)
+                return Path(state["path"])
+            return self.download_stream(stream,dest,item,progress_cb) or dest
+        try:
+            self.download_stream(stream,dest,item,progress_cb)
+            state["path"]=dest
+            return dest
+        finally:
+            state["event"].set()
+            if not state["path"]:
+                with self._shared_audio_lock:
+                    self._shared_audio.pop(fingerprint,None)
 
     def run(self):
         try:
@@ -1393,6 +1565,10 @@ class WorkThread(QThread):
             dub_span=download_part/max(1,len(download_dubs))
             for ep_index,ep in enumerate(episodes,1):
                 self.control.check()
+                self._shared_audio={}
+                self._video_resource=None
+                episode_started=time.monotonic()
+                episode_bytes=self.control.transfer_stats()[2]
                 if self.checkpoint and self.checkpoint.episode_complete(ep):
                     completed+=1
                     self.emit_progress(ep_index,total_eps,100,f"Серия {episode_label(ep)}: уже скачана.")
@@ -1404,25 +1580,37 @@ class WorkThread(QThread):
                     staging=staging/f"season_{self.season_number:02d}"
                 temp_dir=staging/f"episode_{safe_name(ep_label)}"; failed=False
                 prefetch={}
+                scheduled=set()
+
+                def fill_audio_prefetch(video_item):
+                    if not use_merge or len(self.dubbings)<2:
+                        return
+                    while len(prefetch)<self.audio_policy.limit:
+                        next_name=next((name for name in self.dubbings
+                                        if name!=video_item.dubbing and name not in scheduled),None)
+                        if next_name is None:
+                            return
+                        scheduled.add(next_name)
+                        if self.checkpoint and self.checkpoint.file(f"{ep}:{next_name}"):
+                            continue
+                        if self._audio_pool is None:
+                            self._audio_pool=ThreadPoolExecutor(max_workers=3,thread_name_prefix="audio")
+                        prefetch[next_name]=self._audio_pool.submit(self.prefetch_audio,ep,next_name,temp_dir)
+
                 self.emit_progress(ep_index,total_eps,0,f"Серия {ep_label} ({ep_index}/{len(episodes)}): подготовка…")
                 for dub_index,dub in enumerate(download_dubs,1):
                     item=self.episode_items[ep].get(dub); dub_start=(dub_index-1)*dub_span
                     self.emit_progress(ep_index,total_eps,dub_start,f"Серия {ep_label} ({ep_index}/{len(episodes)}): {dub} — получение прямой ссылки…")
                     if not item: errors.append(f"Серия {ep_label}: нет озвучки «{dub}»."); failed=True; break
                     prefetched=None
-                    if dub in prefetch:
-                        future=prefetch[dub]
-                        if future is not None: prefetched=future.result()
-                        # Keep at most two active audio jobs. The next job is
-                        # queued only after the current result is consumed.
-                        remaining=[name for name in self.dubbings if name not in prefetch
-                                   and name != self.episode_items[ep]["__video__"].dubbing]
-                        if remaining:
-                            name=remaining[0]
-                            if not (self.checkpoint and self.checkpoint.file(f"{ep}:{name}")):
-                                prefetch[name]=self._audio_pool.submit(self.prefetch_audio,ep,name,temp_dir)
-                            else:
-                                prefetch[name]=None
+                    scheduled.add(dub)
+                    future=prefetch.pop(dub,None)
+                    if future is not None:
+                        if not future.done():
+                            self.emit_progress(ep_index,total_eps,dub_start,
+                                               f"Серия {ep_label}: {dub} — ожидаю предварительную загрузку…")
+                        prefetched=future.result()
+                        fill_audio_prefetch(self.episode_items[ep]["__video__"])
                     cached=self.checkpoint.file(f"{ep}:{dub}") if self.checkpoint else None
                     if not cached and prefetched and Path(prefetched[0]).is_file():
                         cached=prefetched
@@ -1430,13 +1618,7 @@ class WorkThread(QThread):
                         cached_path,item=cached
                         if dub == "__video__": self.episode_items[ep]["__video__"]=item
                         source_files.append((cached_path,dub))
-                        if dub == "__video__" and use_merge and len(self.dubbings)>1:
-                            pending=[name for name in self.dubbings if name != item.dubbing
-                                     and not (self.checkpoint and self.checkpoint.file(f"{ep}:{name}"))]
-                            if pending:
-                                self._audio_pool=ThreadPoolExecutor(max_workers=2,thread_name_prefix="audio")
-                                for name in pending[:2]:
-                                    prefetch[name]=self._audio_pool.submit(self.prefetch_audio,ep,name,temp_dir)
+                        if dub == "__video__": fill_audio_prefetch(item)
                         self.emit_progress(ep_index,total_eps,dub_start+dub_span,
                                            f"Серия {ep_label}: {dub} — уже скачано")
                         continue
@@ -1454,7 +1636,8 @@ class WorkThread(QThread):
                             candidates = [v for v in candidates if v.dubbing == dub] or [item]
                     else:
                         candidates = self.episode_items[ep].get("__audio_candidates__", {}).get(dub, [item])
-                    attempt_items = source_attempt_order(candidates)
+                    attempt_items = source_attempt_order(candidates,self.source_health,
+                                                        audio_only=use_merge and dub!="__video__")
                     max_attempts = len(attempt_items)
                     last_error = None
 
@@ -1464,6 +1647,7 @@ class WorkThread(QThread):
                         stream = None
                         dest = None
                         try:
+                            started=time.monotonic()
                             if attempt > 1:
                                 self.emit_progress(
                                     ep_index,
@@ -1508,9 +1692,16 @@ class WorkThread(QThread):
                                     f"{dub} · {stream.quality} · {stream.source} — {detail}",
                                 )
 
-                            self.download_stream(stream, dest, item, fp)
+                            if use_merge and dub!="__video__":
+                                with self.active_audio(dub):
+                                    dest=self.download_audio_shared(stream,dest,item,fp)
+                            else:
+                                self.download_stream(stream, dest, item, fp)
                             if dub == "__video__":
                                 self.episode_items[ep]["__video__"] = item
+                                self._video_resource=(stream.url,
+                                                      tuple(sorted((stream.headers or {}).items())),
+                                                      dest,getattr(item,"video_id",None))
                             if not use_merge:
                                 try:
                                     dest=self.ensure_chapters(dest,item,ep)
@@ -1518,20 +1709,18 @@ class WorkThread(QThread):
                                     LOGGER.exception("Chapter processing failed for episode=%s dubbing=%s",ep,dub)
                                     errors.append(f"Серия {ep_label}, {dub}: главы не добавлены: {chapter_error}")
                             if self.checkpoint: self.checkpoint.mark_file(f"{ep}:{dub}",dest,item)
+                            if use_merge and dub!="__video__":
+                                self.source_health.succeeded(item,time.monotonic()-started,dest.stat().st_size)
                             source_files.append((dest, dub))
                             if dub == "__video__" and use_merge and len(self.dubbings)>1:
-                                pending=[name for name in self.dubbings if name != item.dubbing
-                                         and not (self.checkpoint and self.checkpoint.file(f"{ep}:{name}"))]
-                                if pending:
-                                    self._audio_pool=ThreadPoolExecutor(max_workers=2,thread_name_prefix="audio")
-                                    for name in pending[:2]:
-                                        prefetch[name]=self._audio_pool.submit(self.prefetch_audio,ep,name,temp_dir)
+                                fill_audio_prefetch(item)
                             last_error = None
                             break
 
                         except (PauseDownload,StopDownload):
                             raise
                         except Exception as e:
+                            if use_merge and dub!="__video__": self.source_health.failed(item,e)
                             last_error = e
                             LOGGER.exception("Download attempt failed: episode=%s dubbing=%s attempt=%s/%s",
                                              ep,dub,attempt,max_attempts)
@@ -1549,6 +1738,9 @@ class WorkThread(QThread):
                     self._audio_pool.shutdown(wait=True,cancel_futures=failed)
                     self._audio_pool=None
                 if failed:
+                    LOGGER.info("Episode transfer: episode=%s seconds=%.2f network_bytes=%s failed=1",
+                                ep,time.monotonic()-episode_started,
+                                self.control.transfer_stats()[2]-episode_bytes)
                     self.emit_progress(ep_index,total_eps,100,f"Серия {ep_label}: пропущена из-за ошибки."); continue
                 if use_merge:
                     try: plex_ep=f"S{self.season_number:02d}E{int(float(ep)):02d}"
@@ -1578,6 +1770,9 @@ class WorkThread(QThread):
                     if self.checkpoint and source_files:
                         self.checkpoint.complete_episode(ep,source_files[0][0])
                 self.emit_progress(ep_index,total_eps,100,f"Серия {ep_label} ({ep_index}/{len(episodes)}): готово.")
+                LOGGER.info("Episode transfer: episode=%s seconds=%.2f network_bytes=%s failed=0",
+                            ep,time.monotonic()-episode_started,
+                            self.control.transfer_stats()[2]-episode_bytes)
             if use_merge and not self.keep_sources:
                 if self.checkpoint and "series_title" in self.checkpoint.payload.get("settings",{}):
                     try: (title_dir/".tmp"/f"season_{self.season_number:02d}").rmdir()

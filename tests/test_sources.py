@@ -191,8 +191,8 @@ class SourceTests(unittest.TestCase):
         from main import WorkThread, VideoItem
         from resolvers import StreamResult
         video = VideoItem(1, "Alloha", "Video voice", "1", 1, "")
-        bad = VideoItem(2, "Kodik", "Voice", "1", 1, "")
-        good = VideoItem(3, "CVH", "Voice", "1", 1, "")
+        bad = VideoItem(2, "CVH", "Voice", "1", 1, "")
+        good = VideoItem(3, "Kodik", "Voice", "1", 1, "")
         seen = []
         def resolve(item, **kwargs):
             seen.append(item.player)
@@ -217,7 +217,7 @@ class SourceTests(unittest.TestCase):
                  patch.object(worker, "download_stream", side_effect=download), \
                  patch("main.PlayerResolver.release"), patch("main.merge_audio_tracks"):
                 worker.run()
-            self.assertEqual(seen, ["Alloha", "Kodik", "CVH"])
+            self.assertEqual(seen, ["Alloha", "CVH", "Kodik"])
             self.assertEqual(results[0][1], [])
             self.assertIn("Обработано серий: 1", results[0][0])
 

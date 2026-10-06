@@ -1,4 +1,5 @@
 import http.server
+import contextlib
 import threading
 import time
 import tempfile
@@ -8,7 +9,7 @@ from unittest.mock import Mock, patch
 
 import requests
 
-from resilient_download import download_file, download_ranges, DownloadControl, PauseDownload
+from resilient_download import download_file, download_ranges, DownloadControl, PauseDownload, retry_delay
 
 
 class Response:
@@ -38,6 +39,60 @@ class Response:
 
 
 class DownloadTests(unittest.TestCase):
+    def test_retry_after_429_is_honored_and_bounded(self):
+        error=requests.HTTPError(response=Mock(status_code=429,headers={"Retry-After":"120"}))
+        self.assertEqual(retry_delay(error,1),60)
+
+    def test_host_connection_limit_is_four(self):
+        control=DownloadControl()
+        release=threading.Event()
+        entered=[]
+        lock=threading.Lock()
+        def work():
+            with control.transfer("https://same.example/file"):
+                with lock: entered.append(1)
+                release.wait(3)
+        threads=[threading.Thread(target=work) for _ in range(6)]
+        for thread in threads: thread.start()
+        try:
+            deadline=time.monotonic()+2
+            while len(entered)<4 and time.monotonic()<deadline: time.sleep(0.01)
+            self.assertEqual(len(entered),4)
+            self.assertEqual(control.transfer_stats()[0],4)
+        finally:
+            release.set()
+            for thread in threads: thread.join(3)
+        self.assertEqual(len(entered),6)
+
+    def test_waiting_for_host_slot_honors_pause(self):
+        control=DownloadControl()
+        result=[]
+        with contextlib.ExitStack() as stack:
+            for _ in range(4):
+                stack.enter_context(control.transfer("https://same.example/file"))
+            def wait_for_slot():
+                try:
+                    with control.transfer("https://same.example/other"):
+                        result.append("entered")
+                except PauseDownload:
+                    result.append("paused")
+            thread=threading.Thread(target=wait_for_slot)
+            thread.start()
+            time.sleep(0.05)
+            control.request("paused")
+            thread.join(2)
+        self.assertEqual(result,["paused"])
+
+    def test_repeated_cdn_errors_trigger_temporary_bypass(self):
+        control=DownloadControl()
+        for _ in range(3):
+            control.report_host_error("https://bad.example/segment",requests.ConnectionError("TLS"))
+        with self.assertRaisesRegex(RuntimeError,"CDN"):
+            with control.transfer("https://bad.example/next"):
+                pass
+        with control.transfer("https://good.example/segment"):
+            self.assertEqual(control.transfer_stats()[0],1)
+
     def test_pause_terminates_all_registered_processes(self):
         control=DownloadControl()
         processes=[Mock() for _ in range(2)]

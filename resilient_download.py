@@ -6,6 +6,11 @@ import json
 import re
 import time
 import threading
+import contextlib
+import urllib.parse
+from collections import defaultdict, deque
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from pathlib import Path
 
@@ -20,6 +25,23 @@ RETRYABLE = (
     requests.exceptions.ChunkedEncodingError,
 )
 CONTENT_RANGE = re.compile(r"bytes (\d+)-(\d+)/(\d+|\*)$", re.I)
+
+
+def retry_delay(error, attempt):
+    """Honor bounded Retry-After for throttling; otherwise use backoff."""
+    response = getattr(error, "response", None)
+    if response is not None and response.status_code == 429:
+        value = response.headers.get("Retry-After", "").strip()
+        try:
+            seconds = float(value)
+        except ValueError:
+            try:
+                seconds = (parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                seconds = 0
+        if seconds > 0:
+            return min(60.0, seconds)
+    return min(8.0, 0.8 * 2 ** (attempt - 1)) * random.uniform(0.75, 1.25)
 
 
 class RangeUnsupportedError(RuntimeError):
@@ -44,6 +66,75 @@ class DownloadControl:
         self._event = threading.Event()
         self._mode = "running"
         self._processes = set()
+        self._global_slots = threading.BoundedSemaphore(8)
+        self._host_slots = defaultdict(lambda: threading.BoundedSemaphore(4))
+        self._active_transfers = 0
+        self._received_bytes = 0
+        self._recent_bytes = deque()
+        self._host_errors = defaultdict(deque)
+        self._host_cooldown = {}
+
+    def report_host_error(self, url, error):
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+        if not host:
+            return
+        now = time.monotonic()
+        with self._lock:
+            errors = self._host_errors[host]
+            errors.append(now)
+            while errors and now-errors[0] > 60:
+                errors.popleft()
+            if len(errors) >= 3:
+                self._host_cooldown[host] = now + 60
+                LOGGER.warning("CDN temporarily bypassed after repeated errors: host=%s error=%s",
+                               host,type(error).__name__)
+
+    @contextlib.contextmanager
+    def transfer(self, url):
+        """Limit the total and per-host number of simultaneous HTTP streams."""
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+        with self._lock:
+            host_slot = self._host_slots[host]
+        while True:
+            self.check()
+            with self._lock:
+                if self._host_cooldown.get(host,0) > time.monotonic():
+                    raise RuntimeError("Сервер CDN временно исключён после повторных ошибок.")
+            if host_slot.acquire(timeout=0.2):
+                break
+        try:
+            while True:
+                self.check()
+                if self._global_slots.acquire(timeout=0.2):
+                    break
+            with self._lock:
+                self._active_transfers += 1
+            try:
+                yield
+            finally:
+                with self._lock:
+                    self._active_transfers -= 1
+                self._global_slots.release()
+        finally:
+            host_slot.release()
+
+    def record_bytes(self, count):
+        if count <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            self._received_bytes += count
+            self._recent_bytes.append((now, count))
+            while self._recent_bytes and now-self._recent_bytes[0][0] > 10:
+                self._recent_bytes.popleft()
+
+    def transfer_stats(self):
+        with self._lock:
+            now = time.monotonic()
+            while self._recent_bytes and now-self._recent_bytes[0][0] > 10:
+                self._recent_bytes.popleft()
+            span = max(1.0, min(10.0, now-self._recent_bytes[0][0])) if self._recent_bytes else 1.0
+            return self._active_transfers, sum(n for _,n in self._recent_bytes)/span, self._received_bytes
 
     def request(self, mode):
         if mode not in ("paused", "stopped"):
@@ -119,7 +210,7 @@ def download_file(url, path, headers, progress_cb, *, attempts=4, sleep=time.sle
         LOGGER.debug("Download request %s attempt=%s/%s offset=%s", safe_url(url), attempt, attempts, offset)
         try:
             get = session.get if session is not None else requests.get
-            with get(url, headers=request_headers, stream=True,
+            with (control.transfer(url) if control else contextlib.nullcontext()), get(url, headers=request_headers, stream=True,
                               timeout=(15, 60), allow_redirects=True) as response:
                 if offset and response.status_code == 416:
                     part.unlink(missing_ok=True)
@@ -161,6 +252,7 @@ def download_file(url, path, headers, progress_cb, *, attempts=4, sleep=time.sle
                         if not chunk:
                             continue
                         output.write(chunk)
+                        if control: control.record_bytes(len(chunk))
                         downloaded += len(chunk)
                         if total:
                             pct = max(0, min(99, int(downloaded * 100 / total)))
@@ -182,7 +274,11 @@ def download_file(url, path, headers, progress_cb, *, attempts=4, sleep=time.sle
             LOGGER.info("Download complete: %s bytes=%s", path, path.stat().st_size)
             progress_cb(100, "100%")
             return
-        except RETRYABLE as error:
+        except (*RETRYABLE, requests.HTTPError) as error:
+            if isinstance(error, requests.HTTPError) and error.response is not None:
+                if error.response.status_code != 429 and error.response.status_code < 500:
+                    raise
+            if control: control.report_host_error(url,error)
             if session is not None:
                 session.close()  # Discard a broken pool before reconnecting.
             last_error = error
@@ -190,7 +286,7 @@ def download_file(url, path, headers, progress_cb, *, attempts=4, sleep=time.sle
                            attempt, attempts, type(error).__name__, error)
             if attempt == attempts:
                 break
-            delay = min(8.0, 0.8 * 2 ** (attempt - 1)) * random.uniform(0.75, 1.25)
+            delay = retry_delay(error, attempt)
             progress_cb(0, f"Сеть прервана; повтор {attempt + 1}/{attempts} через {delay:.1f} с…")
             sleep(delay)
             if control:
@@ -228,7 +324,7 @@ def download_ranges(url, path, headers, progress, *, block_size=1024 * 1024,
                 if validator:
                     request_headers["If-Range"] = validator
                 try:
-                    with session.get(url, headers=request_headers, stream=True,
+                    with (control.transfer(url) if control else contextlib.nullcontext()), session.get(url, headers=request_headers, stream=True,
                                      timeout=(15, 60)) as response:
                         response.raise_for_status()
                         if response.status_code == 200:
@@ -269,6 +365,7 @@ def download_ranges(url, path, headers, progress, *, block_size=1024 * 1024,
                             if control:
                                 control.check()
                             block.extend(chunk)
+                            if control: control.record_bytes(len(chunk))
                             if len(block) > end - start + 1:
                                 raise RuntimeError("Размер блока превышает Content-Range.")
                         if len(block) != end - start + 1:
@@ -283,6 +380,7 @@ def download_ranges(url, path, headers, progress, *, block_size=1024 * 1024,
                     if isinstance(error, requests.HTTPError) and error.response is not None:
                         if error.response.status_code != 429 and error.response.status_code < 500:
                             raise
+                    if control: control.report_host_error(url,error)
                     last_error = error
                     session.close()
                     LOGGER.warning("MP4 range interrupted offset=%s attempt=%s/%s: %s",
@@ -290,7 +388,7 @@ def download_ranges(url, path, headers, progress, *, block_size=1024 * 1024,
                     if attempt < attempts:
                         progress(int(offset * 100 / total) if total else 0,
                                  f"Повтор блока MP4 {attempt + 1}/{attempts}…")
-                        sleep(min(8, 0.8 * 2 ** (attempt - 1)))
+                        sleep(retry_delay(error, attempt))
                         if control:
                             control.check()
             else:
@@ -339,7 +437,7 @@ def download_ranges_parallel(url, path, headers, progress, *, block_size=1048576
             if validator:
                 request_headers["If-Range"] = validator
             try:
-                with session.get(url,headers=request_headers,stream=True,timeout=(15,60)) as response:
+                with (control.transfer(url) if control else contextlib.nullcontext()), session.get(url,headers=request_headers,stream=True,timeout=(15,60)) as response:
                     response.raise_for_status()
                     if response.status_code == 200 and total is None:
                         return None
@@ -363,6 +461,7 @@ def download_ranges_parallel(url, path, headers, progress, *, block_size=1048576
                         if stopped.is_set():
                             raise RuntimeError("Загрузка блока отменена.")
                         block.extend(chunk)
+                        if control: control.record_bytes(len(chunk))
                         if len(block) > right-left+1:
                             raise RuntimeError("Размер блока превышает Content-Range.")
                     if len(block) != right-left+1:
@@ -372,12 +471,13 @@ def download_ranges_parallel(url, path, headers, progress, *, block_size=1048576
                 if isinstance(error,requests.HTTPError) and error.response is not None:
                     if error.response.status_code != 429 and error.response.status_code < 500:
                         raise
+                if control: control.report_host_error(url,error)
                 session.close()
                 LOGGER.warning("MP4 range interrupted offset=%s attempt=%s/%s: %s",
                                start,attempt,attempts,type(error).__name__)
                 if attempt == attempts:
                     raise RangeDownloadError(f"Не удалось скачать блок MP4 после {attempts} попыток: {error}") from error
-                delay = min(8,0.8*2**(attempt-1))
+                delay = retry_delay(error, attempt)
                 if sleep is time.sleep:
                     if control:
                         control.wait(delay)
