@@ -107,6 +107,35 @@ class UpdaterTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "python DLL missing"):
                     updater.validate_executable(executable)
 
+    def test_independent_environment_preserves_settings_without_mutating_parent(self):
+        inherited = {"_PYI_APPLICATION_HOME_DIR": "removed-temp",
+                     "PYINSTALLER_RESET_ENVIRONMENT": "0", "PATH": "user-path"}
+        with patch.dict(updater.os.environ, inherited, clear=True):
+            environment = updater.independent_executable_environment()
+            self.assertEqual(environment["PYINSTALLER_RESET_ENVIRONMENT"], "1")
+            self.assertEqual(environment["PATH"], "user-path")
+            self.assertEqual(dict(updater.os.environ), inherited)
+
+    def test_executable_validation_requests_fresh_unpack(self):
+        with patch.object(updater.subprocess, "run", return_value=Mock(returncode=0)) as run:
+            updater.validate_executable("update.exe")
+        self.assertEqual(run.call_args.kwargs["env"]["PYINSTALLER_RESET_ENVIRONMENT"], "1")
+        self.assertEqual(run.call_args.args[0][-1], "--self-test")
+
+    def test_replacement_helper_resets_environment_for_restart_and_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            current, staged = root / "app.exe", root / "app.new.exe"
+            staged.write_bytes(b"verified executable")
+            with patch.object(updater, "CONFIG_FILE", root / "config.json"), \
+                 patch.object(updater.subprocess, "Popen") as launch:
+                updater.schedule_exe_replacement(current, staged, updater.sha256_file(staged))
+            self.assertEqual(launch.call_args.kwargs["env"]["PYINSTALLER_RESET_ENVIRONMENT"], "1")
+            helper = (root / "apply-update.ps1").read_text(encoding="utf-8")
+            reset = helper.index("$env:PYINSTALLER_RESET_ENVIRONMENT = '1'")
+            self.assertLess(reset, helper.index("Start-Process -FilePath $currentPath"))
+            self.assertLess(reset, helper.index("Start-Process -FilePath $Current"))
+
 
 if __name__ == "__main__":
     unittest.main()

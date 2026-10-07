@@ -134,6 +134,11 @@ def download_verified(asset, destination, progress_cb=lambda *_: None):
     return destination
 
 
+def independent_executable_environment():
+    """Unpack a fresh onefile instance instead of reusing the parent's temp files."""
+    return {**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"}
+
+
 def validate_executable(path, *, timeout=30):
     """Run the packaged application's import-only smoke test before replacing it."""
     path = Path(path).resolve()
@@ -141,7 +146,8 @@ def validate_executable(path, *, timeout=30):
     try:
         result = subprocess.run([str(path), "--self-test"], cwd=path.parent,
                                 capture_output=True, text=True, timeout=timeout,
-                                creationflags=flags)
+                                creationflags=flags,
+                                env=independent_executable_environment())
     except subprocess.TimeoutExpired as error:
         raise RuntimeError("Проверка запуска обновления не завершилась вовремя.") from error
     if result.returncode != 0:
@@ -217,6 +223,9 @@ POWERSHELL_HELPER = r'''
 param([int]$ParentPid, [string]$Current, [string]$Staged, [string]$ExpectedHash, [string]$ResultFile)
 $ErrorActionPreference = 'Stop'
 try {
+    # The old onefile instance removes its extracted DLLs when it exits.
+    # Both the updated executable and the fallback must unpack independently.
+    $env:PYINSTALLER_RESET_ENVIRONMENT = '1'
     $currentPath = [IO.Path]::GetFullPath($Current)
     $stagedPath = [IO.Path]::GetFullPath($Staged)
     if ([IO.Path]::GetDirectoryName($currentPath) -ne [IO.Path]::GetDirectoryName($stagedPath)) {
@@ -269,5 +278,6 @@ def schedule_exe_replacement(current, staged, expected_hash):
                       "-File", str(helper), "-ParentPid", str(os.getpid()),
                       "-Current", str(current), "-Staged", str(staged),
                       "-ExpectedHash", expected_hash, "-ResultFile", str(result_file)],
-                     creationflags=flags, close_fds=True)
+                     creationflags=flags, close_fds=True,
+                     env=independent_executable_environment())
     return result_file
